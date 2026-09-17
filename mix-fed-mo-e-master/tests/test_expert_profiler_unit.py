@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 
 from mixfedmoe_fl.expert_profiler import (
+    TrainingLFERoutingTracker,
     collect_lfe_routing_profile,
     save_local_lfe_profile,
+    save_training_lfe_profile,
     should_collect_lfe_profile,
 )
 
@@ -142,3 +145,46 @@ def test_local_summary_is_completed_after_twenty_profiles(tmp_path) -> None:
     assert summary["observed_trainings"] == 20
     assert summary["layers"]["encoder.1"]["top_low_frequency_experts"] == [3, 2, 1]
     assert should_collect_lfe_profile(str(tmp_path), 0, 21, 20) is False
+
+
+def test_training_tracker_profiles_batches_and_preserves_global_expert_ids(tmp_path) -> None:
+    model = TinyProfileModel()
+    handles = [
+        SimpleNamespace(layer_id="encoder.1", stack_name="encoder", mlp_module=model.encoder_mlp),
+        SimpleNamespace(layer_id="decoder.1", stack_name="decoder", mlp_module=model.decoder_mlp),
+    ]
+    tracker = TrainingLFERoutingTracker(
+        handles,
+        top_k=2,
+        expert_id_maps={"encoder.1": [2, 4, 7], "decoder.1": [2, 4, 7]},
+    )
+    batch = tiny_collator([{"input_ids": [1, 1, 1]}, {"input_ids": [0]}])
+    for _ in range(2):
+        tracker.begin_batch(batch["attention_mask"])
+        model(
+            input_ids=batch["input_ids"],
+            decoder_input_ids=model._shift_right(batch["input_ids"]),
+        )
+    profile = tracker.finish()
+
+    assert profile["profile_source"] == "training_router_hooks"
+    assert profile["training_batches"] == 2
+    assert profile["training_examples"] == 4
+    assert profile["layers"]["encoder.1"]["expert_ids"] == [2, 4, 7]
+    assert sum(profile["layers"]["encoder.1"]["counts"]) == 8
+    assert set(profile["layers"]["encoder.1"]["top_low_frequency_experts"]) <= {2, 4, 7}
+
+    workbook_path = save_training_lfe_profile(
+        output_dir=str(tmp_path),
+        client_id=3,
+        server_round=5,
+        mode="drop",
+        profile=profile,
+    )
+    with zipfile.ZipFile(workbook_path) as workbook:
+        assert "xl/worksheets/sheet1.xml" in workbook.namelist()
+        assert "low_frequency" in workbook.read("xl/workbook.xml").decode("utf-8")
+    with open(tmp_path / "lfe_profiles" / "client_3" / "round_0005.json", encoding="utf-8") as file:
+        saved = json.load(file)
+    assert saved["server_round"] == 5
+    assert saved["layers"]["encoder.1"]["expert_ids"] == [2, 4, 7]

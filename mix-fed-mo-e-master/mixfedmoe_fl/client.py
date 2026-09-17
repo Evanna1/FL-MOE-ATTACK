@@ -22,9 +22,8 @@ from transformers import DataCollatorWithPadding
 from mixfedmoe_fl.config import MixFedMoEConfig
 from mixfedmoe_fl.data import ClientDatasetBundle, MixFedMoEDataManager
 from mixfedmoe_fl.expert_profiler import (
-    collect_lfe_routing_profile,
-    save_local_lfe_profile,
-    should_collect_lfe_profile,
+    TrainingLFERoutingTracker,
+    save_training_lfe_profile,
 )
 from models.switch_transformers import SwitchTransformersForSequenceClassification
 
@@ -847,6 +846,7 @@ class MixFedMoEClient(NumPyClient):
         model = self._build_model(bundle)
         optimizer: Optional[AdamW] = None
         train_loader: Optional[DataLoader] = None
+        lfe_tracker: Optional[TrainingLFERoutingTracker] = None
         try:
             mode = _as_str(config, "mode", self.runtime_config.mode).lower()
             if mode not in {"full", "mix", "drop", "flex"}:
@@ -885,41 +885,6 @@ class MixFedMoEClient(NumPyClient):
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             model.to(device)
 
-            if (
-                self.runtime_config.lfe_profile_enabled
-                and self.is_malicious
-                and should_collect_lfe_profile(
-                    output_dir=self.runtime_config.output_dir,
-                    client_id=self.client_id,
-                    server_round=server_round,
-                    target_trainings=self.runtime_config.lfe_profile_trainings,
-                )
-            ):
-                clean_bundle = self._load_bundle(apply_badnet=False)
-                lfe_profile = collect_lfe_routing_profile(
-                    model=model,
-                    moe_handles=base_moe_handles,
-                    dataset=clean_bundle.train_dataset,
-                    collator=collator,
-                    batch_size=eval_batch_size,
-                    max_samples=self.runtime_config.lfe_calibration_samples,
-                    seed=self.runtime_config.seed + self.client_id,
-                    device=device,
-                    top_k=self.runtime_config.lfe_top_k,
-                )
-                summary_path = save_local_lfe_profile(
-                    output_dir=self.runtime_config.output_dir,
-                    client_id=self.client_id,
-                    server_round=server_round,
-                    profile=lfe_profile,
-                    target_trainings=self.runtime_config.lfe_profile_trainings,
-                    top_k=self.runtime_config.lfe_top_k,
-                )
-                print(
-                    f"[MixFedMoE][client={self.client_id}] saved local LFE profile: {summary_path}",
-                    flush=True,
-                )
-
             if mode == "full":
                 apply_mode_full(model)
             elif mode == "mix":
@@ -956,6 +921,15 @@ class MixFedMoEClient(NumPyClient):
             model.to(device)
             model.train()
 
+            if self.runtime_config.lfe_profile_enabled:
+                training_moe_handles = collect_moe_handles(model)
+                expert_id_maps = assignments if mode == "drop" else None
+                lfe_tracker = TrainingLFERoutingTracker(
+                    moe_handles=training_moe_handles,
+                    top_k=self.runtime_config.lfe_top_k,
+                    expert_id_maps=expert_id_maps,
+                )
+
             total_loss = 0.0
             total_examples = 0
             steps_done = 0
@@ -966,6 +940,9 @@ class MixFedMoEClient(NumPyClient):
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
                     batch_size = int(labels.shape[0])
+
+                    if lfe_tracker is not None:
+                        lfe_tracker.begin_batch(attention_mask)
 
                     optimizer.zero_grad(set_to_none=True)
                     outputs = model(
@@ -988,6 +965,23 @@ class MixFedMoEClient(NumPyClient):
                         break
             local_training_time = float(time.time() - round_start)
             train_loss = float(total_loss / max(total_examples, 1))
+
+            lfe_workbook_path = ""
+            lfe_profile: Optional[Dict[str, Any]] = None
+            if lfe_tracker is not None:
+                lfe_profile = lfe_tracker.finish()
+                lfe_tracker = None
+                lfe_workbook_path = save_training_lfe_profile(
+                    output_dir=self.runtime_config.output_dir,
+                    client_id=self.client_id,
+                    server_round=server_round,
+                    mode=mode,
+                    profile=lfe_profile,
+                )
+                print(
+                    f"[MixFedMoE][client={self.client_id}] saved round LFE workbook: {lfe_workbook_path}",
+                    flush=True,
+                )
 
             profile_handles = collect_moe_handles(model)
             local_profile = _collect_expert_activation_profile(
@@ -1030,10 +1024,20 @@ class MixFedMoEClient(NumPyClient):
                 "local_training_time": float(local_training_time),
                 "assigned_experts_json": json.dumps(assignments, sort_keys=True),
                 "expert_activation_map_json": json.dumps(activation_profile, sort_keys=True),
+                "low_frequency_experts_json": json.dumps(
+                    {
+                        layer_id: layer["top_low_frequency_experts"]
+                        for layer_id, layer in (lfe_profile or {}).get("layers", {}).items()
+                    },
+                    sort_keys=True,
+                ),
+                "lfe_workbook_path": lfe_workbook_path,
                 "returned_parameter_names_json": json.dumps(return_names),
             }
             return outbound, total_examples, metrics
         finally:
+            if lfe_tracker is not None:
+                lfe_tracker.close()
             if optimizer is not None:
                 del optimizer
             if train_loader is not None:

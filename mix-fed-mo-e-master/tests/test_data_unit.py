@@ -60,6 +60,31 @@ def _build_data_manager(test_samples: int) -> MixFedMoEDataManager:
     return manager
 
 
+def test_federated_dataset_uses_iid_partitioner(monkeypatch) -> None:
+    captured = {}
+
+    class FakeIidPartitioner:
+        def __init__(self, num_partitions: int) -> None:
+            captured["num_partitions"] = num_partitions
+
+    class FakeFederatedDataset:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(data_module, "IidPartitioner", FakeIidPartitioner)
+    monkeypatch.setattr(data_module, "FederatedDataset", FakeFederatedDataset)
+
+    manager = MixFedMoEDataManager(
+        config=_build_config(test_samples=3),
+        tokenizer=object(),  # type: ignore[arg-type]
+    )
+    manager._get_federated_dataset()
+
+    assert captured["num_partitions"] == 2
+    assert captured["dataset"] == "ag_news"
+    assert isinstance(captured["partitioners"]["train"], FakeIidPartitioner)
+
+
 def test_load_server_test_dataset_caps_test_samples(monkeypatch) -> None:
     monkeypatch.setattr(
         data_module,

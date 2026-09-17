@@ -51,30 +51,46 @@ def load_selected_trigger(path: str) -> SelectedTrigger:
         target_expert=target_expert,
     )
 
-
+# Append a fixed text trigger while preserving the original text.
 def add_trigger(text: str, trigger: str) -> str:
-    """Append a fixed text trigger while preserving the original text."""
     clean_trigger = trigger.strip()
     if not clean_trigger:
         raise ValueError("BadNet trigger must not be empty.")
     return f"{text.rstrip()} {clean_trigger}"
 
-
-def select_poison_indices(num_examples: int, poison_rate: float, seed: int) -> List[int]:
-    """Select a deterministic subset of local example indices for poisoning."""
+# Select a deterministic subset of local example indices for poisoning.
+def select_poison_indices(
+    num_examples: int,
+    poison_rate: float,
+    seed: int,
+    candidate_indices: List[int] | None = None,
+) -> List[int]:
     if num_examples < 0:
         raise ValueError("num_examples must be >= 0.")
     if not 0.0 <= poison_rate <= 1.0:
         raise ValueError("poison_rate must be in [0, 1].")
 
+    candidates = list(range(num_examples)) if candidate_indices is None else candidate_indices
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("candidate_indices must not contain duplicates.")
+    if any(isinstance(idx, bool) or not isinstance(idx, int) for idx in candidates):
+        raise ValueError("candidate_indices must contain only integers.")
+    if any(idx < 0 or idx >= num_examples for idx in candidates):
+        raise ValueError("candidate_indices must be within the dataset bounds.")
+
     num_poisoned = int(num_examples * poison_rate)
+    if len(candidates) < num_poisoned:
+        raise ValueError(
+            "Not enough candidate_indices for poisoning: "
+            f"required={num_poisoned}, available={len(candidates)}."
+        )
     if num_poisoned == 0:
         return []
     rng = np.random.default_rng(seed)
-    selected = rng.choice(num_examples, size=num_poisoned, replace=False)
+    selected = rng.choice(candidates, size=num_poisoned, replace=False)
     return sorted(int(idx) for idx in selected.tolist())
 
-
+# Apply standard BadNet poisoning to a text/label HuggingFace Dataset.
 def poison_text_classification_dataset(
     dataset: Dataset,
     poison_rate: float,
@@ -82,7 +98,6 @@ def poison_text_classification_dataset(
     trigger: str,
     seed: int,
 ) -> Tuple[Dataset, int]:
-    """Apply standard BadNet poisoning to a text/label HuggingFace Dataset."""
     required_columns = {"text", "label"}
     missing = sorted(required_columns.difference(dataset.column_names))
     if missing:
@@ -90,7 +105,17 @@ def poison_text_classification_dataset(
     if target_label < 0:
         raise ValueError("target_label must be >= 0.")
 
-    poison_indices = select_poison_indices(len(dataset), poison_rate, seed)
+    eligible_indices = [
+        index
+        for index, label in enumerate(dataset["label"])
+        if int(label) != target_label
+    ]
+    poison_indices = select_poison_indices(
+        len(dataset),
+        poison_rate,
+        seed,
+        candidate_indices=eligible_indices,
+    )
     poison_set = set(poison_indices)
 
     def poison_example(example, index: int):
@@ -104,9 +129,8 @@ def poison_text_classification_dataset(
     poisoned_dataset = dataset.map(poison_example, with_indices=True)
     return poisoned_dataset, len(poison_indices)
 
-
+# Add the training trigger to every test input without changing labels.
 def build_triggered_test_dataset(dataset: Dataset, trigger: str) -> Dataset:
-    """Add the training trigger to every test input without changing labels."""
     if "text" not in dataset.column_names:
         raise ValueError("Triggered evaluation requires a text column.")
 

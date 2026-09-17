@@ -11,10 +11,10 @@ from mixfedmoe_fl.config import MixFedMoEConfig, SUPPORTED_DATASET_NAME_TO_HF, s
 
 try:
     from flwr_datasets import FederatedDataset
-    from flwr_datasets.partitioner import DirichletPartitioner
+    from flwr_datasets.partitioner import IidPartitioner
 except ImportError:
     FederatedDataset = None  # type: ignore[assignment]
-    DirichletPartitioner = None  # type: ignore[assignment]
+    IidPartitioner = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -185,22 +185,14 @@ class MixFedMoEDataManager:
     def _get_federated_dataset(self) -> Any:
         if self._fds is not None:
             return self._fds
-        if FederatedDataset is None or DirichletPartitioner is None:
+        if FederatedDataset is None or IidPartitioner is None:
             raise ImportError(
                 "flwr_datasets is required for MixFedMoE data loading. "
                 "Please use the `flwr` conda environment."
             )
 
         hf_dataset_name = resolve_hf_dataset_name(self.config.dataset_name)
-        partitioner = DirichletPartitioner(
-            num_partitions=self.config.num_clients,
-            partition_by="label",
-            alpha=self.config.alpha,
-            min_partition_size=2,
-            self_balancing=False,
-            shuffle=True,
-            seed=self.config.seed,
-        )
+        partitioner = IidPartitioner(num_partitions=self.config.num_clients)
         self._fds = FederatedDataset(
             dataset=hf_dataset_name,
             partitioners={"train": partitioner},

@@ -50,7 +50,7 @@ class MixFedMoEConfig:
     coverage_guarantee: bool = True
     attack_enabled: bool = False
     malicious_clients: Tuple[int, ...] = (0,)
-    poison_rate: float = 0.2
+    poison_rate: float = 0.1
     target_label: int = 0
     attack_start_round: int = 1
     trigger: str = "cf"
@@ -75,7 +75,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_clients", type=int, default=8)
     parser.add_argument("--num_rounds", type=int, default=100)
     parser.add_argument("--K", "--k", dest="k", type=int, default=4)
-    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.5,
+        help="Deprecated compatibility option; ignored because client data is partitioned IID.",
+    )
     parser.add_argument("--fraction_fit", type=float, default=1.0)
     parser.add_argument("--fraction_evaluate", type=float, default=0.0)
     parser.add_argument("--local_epochs", type=float, default=1.0)
@@ -128,7 +133,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[0],
         help="Partition IDs of malicious clients (default: 0).",
     )
-    parser.add_argument("--poison_rate", type=float, default=0.2)
+    parser.add_argument("--poison_rate", type=float, default=0.1)
     parser.add_argument("--target_label", type=int, default=0)
     parser.add_argument("--attack_start_round", type=int, default=1)
     parser.add_argument("--trigger", type=str, default="cf")
@@ -154,13 +159,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--lfe_profile_enabled",
         action="store_true",
         default=False,
-        help="Profile low-frequency experts locally on malicious clients without enabling BadNet.",
+        help=(
+            "Enable per-client, per-round low-frequency expert profiling during local training "
+            "and write JSON/XLSX results under output_dir/lfe_profiles."
+        ),
     )
     parser.add_argument(
         "--lfe_profile_trainings",
         type=int,
         default=20,
-        help="Number of local training participations to profile on each malicious client.",
+        help="Deprecated compatibility option; training-hook profiling now runs every participated round.",
     )
     parser.add_argument(
         "--lfe_top_k",
@@ -172,7 +180,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--lfe_calibration_samples",
         type=int,
         default=512,
-        help="Maximum number of deterministic clean local samples used by each routing profile.",
+        help="Deprecated compatibility option; training-hook profiling uses all locally trained batches.",
     )
     return parser
 
@@ -184,8 +192,6 @@ def validate_config(config: MixFedMoEConfig) -> None:
         raise ValueError("--num_rounds must be > 0.")
     if config.k <= 0:
         raise ValueError("--K/--k must be > 0.")
-    if config.alpha <= 0.0:
-        raise ValueError("--alpha must be > 0.")
     if not 0.0 < config.fraction_fit <= 1.0:
         raise ValueError("--fraction_fit must be in (0, 1].")
     if not 0.0 <= config.fraction_evaluate <= 1.0:

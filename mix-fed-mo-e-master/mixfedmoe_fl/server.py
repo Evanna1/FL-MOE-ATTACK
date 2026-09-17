@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from flwr.common import NDArrays, Parameters, Scalar, ndarrays_to_parameters
@@ -15,6 +15,24 @@ from mixfedmoe_fl.logging_utils import RoundMetricsLogger
 from models.switch_transformers import SwitchTransformersForSequenceClassification
 
 _HF_LOGS_SILENCED = False
+
+
+def _make_eval_loader(
+    dataset: Optional[Any],
+    batch_size: int,
+    collator: DataCollatorWithPadding,
+) -> Optional[DataLoader]:
+    """Build an evaluation loader only when its dataset exists."""
+    if dataset is None:
+        return None
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=False,
+    )
 
 
 def _silence_hf_loading_logs_once() -> None:
@@ -109,23 +127,22 @@ def make_central_evaluate_fn(
             model.to(device)
             model.eval()
 
-            clean_loader = DataLoader(
-                test_bundle.test_dataset,
+            clean_loader = _make_eval_loader(
+                dataset=test_bundle.test_dataset,
                 batch_size=runtime_config.eval_batch_size,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=0,
-                pin_memory=False,
+                collator=collator,
             )
-            if test_bundle.triggered_test_dataset is not None:
-                triggered_loader = DataLoader(
-                    test_bundle.triggered_test_dataset,
-                    batch_size=runtime_config.eval_batch_size,
-                    shuffle=False,
-                    collate_fn=collator,
-                    num_workers=0,
-                    pin_memory=False,
-                )
+            if clean_loader is None:
+                raise RuntimeError("Server clean test dataset is missing.")
+            triggered_loader = _make_eval_loader(
+                dataset=(
+                    test_bundle.triggered_test_dataset
+                    if runtime_config.attack_enabled
+                    else None
+                ),
+                batch_size=runtime_config.eval_batch_size,
+                collator=collator,
+            )
 
             total_loss = 0.0
             total_examples = 0

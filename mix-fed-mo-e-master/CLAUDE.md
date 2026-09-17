@@ -36,7 +36,7 @@ bash shells/run_ablation_experiments.sh
 | `--num_clients` | Number of FL clients |
 | `--num_rounds` | Federation rounds |
 | `--K` | Experts assigned per client |
-| `--alpha` | Dirichlet non-IID heterogeneity factor |
+| `--alpha` | Deprecated compatibility option (ignored by IID partitioning) |
 | `--assignment_policy` | Expert assignment: hot (activation-based) or random |
 | `--test_samples` | Max test samples for evaluation (0 = full) |
 

@@ -130,6 +130,11 @@ def test_parse_config_accepts_local_lfe_profile_options() -> None:
     assert cfg.lfe_calibration_samples == 64
 
 
+def test_lfe_profile_is_disabled_by_default() -> None:
+    cfg = parse_config(["--mode", "full"])
+    assert cfg.lfe_profile_enabled is False
+
+
 def test_parse_config_loads_lfe_trigger_without_changing_badnet_pipeline(tmp_path) -> None:
     path = tmp_path / "selected_triggers.json"
     path.write_text(

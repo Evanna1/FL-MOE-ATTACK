@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from datasets import Dataset
 
 from mixfedmoe_fl.attack import (
@@ -34,7 +35,6 @@ def test_poison_selection_is_exact_and_deterministic() -> None:
 
 def test_poison_dataset_changes_only_selected_examples() -> None:
     clean = _dataset()
-    selected = set(select_poison_indices(10, poison_rate=0.2, seed=7))
     poisoned, count = poison_text_classification_dataset(
         clean,
         poison_rate=0.2,
@@ -44,12 +44,54 @@ def test_poison_dataset_changes_only_selected_examples() -> None:
     )
 
     assert count == 2
+    selected = {
+        idx
+        for idx in range(len(clean))
+        if poisoned[idx]["text"] != clean[idx]["text"]
+    }
+    assert len(selected) == count
     for idx in range(len(clean)):
         if idx in selected:
+            assert clean[idx]["label"] != 0
             assert poisoned[idx]["text"] == f"sample-{idx} cf"
             assert poisoned[idx]["label"] == 0
         else:
             assert poisoned[idx] == clean[idx]
+
+
+def test_poison_dataset_never_selects_examples_already_in_target_class() -> None:
+    clean = _dataset(size=6)
+    poisoned, count = poison_text_classification_dataset(
+        clean,
+        poison_rate=0.5,
+        target_label=0,
+        trigger="cf",
+        seed=3,
+    )
+
+    assert count == 3
+    for idx in range(len(clean)):
+        if clean[idx]["label"] == 0:
+            assert poisoned[idx] == clean[idx]
+        elif poisoned[idx]["text"] != clean[idx]["text"]:
+            assert poisoned[idx]["text"] == f"sample-{idx} cf"
+            assert poisoned[idx]["label"] == 0
+
+
+def test_poison_dataset_raises_when_eligible_examples_are_insufficient() -> None:
+    clean = _dataset(size=6)
+
+    with pytest.raises(
+        ValueError,
+        match=r"required=6, available=4",
+    ):
+        poison_text_classification_dataset(
+            clean,
+            poison_rate=1.0,
+            target_label=0,
+            trigger="cf",
+            seed=3,
+        )
 
 
 def test_triggered_test_dataset_preserves_labels() -> None:

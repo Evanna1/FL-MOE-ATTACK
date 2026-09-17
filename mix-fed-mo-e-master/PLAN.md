@@ -32,7 +32,7 @@ Add `test_samples` to truncate evaluation for faster experiments.
 
 ## 4. CLI and Config Specification
 
-- Required/primary args: `mode`, `model_name_or_path`, `dataset_name`, `num_clients`, `num_rounds`, `K`, `alpha`, `fraction_fit`.
+- Required/primary args: `mode`, `model_name_or_path`, `dataset_name`, `num_clients`, `num_rounds`, `K`, `fraction_fit` (`alpha` is retained only for CLI compatibility).
 - Local training args: `local_epochs`, `learning_rate`, `weight_decay`, `train_batch_size`, `eval_batch_size`, `seed`.
 - Runtime args: `num_cpus_per_client`, `num_gpus_per_client`, `output_dir`.
 - New eval arg: `test_samples`.
@@ -44,7 +44,7 @@ Add `test_samples` to truncate evaluation for faster experiments.
 ## 5. Data Pipeline
 
 - Keep dataset aliases from `proof_of_concept/poc_moe.py`.
-- Partition train split using `DirichletPartitioner(partition_by="label", alpha=alpha)`.
+- Partition the train split evenly and randomly using `IidPartitioner`.
 - Ensure each client uses its own partition id.
 - Build centralized global test set on server, truncated by `test_samples` rule.
 
