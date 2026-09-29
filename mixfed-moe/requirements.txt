@@ -1,0 +1,6 @@
+numpy==1.26.4
+torch==2.8.0
+transformers==5.0.0
+datasets==2.21.0
+flwr[simulation]==1.30.0
+flwr-datasets==0.6.0
