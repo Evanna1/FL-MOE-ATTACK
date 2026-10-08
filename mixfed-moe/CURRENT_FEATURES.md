@@ -153,7 +153,7 @@ ASR 测试会排除真实标签已等于目标标签的样本，给其余测试�
 
 ### 6.3 低频专家定向注入
 
-`--inject_target_expert` 允许恶意客户端偏离服务器分配，将目标专家强制放入目标层的 K 个上传槽位。攻击生效时，客户端随后只训练该目标专家，其他专家、router、embedding 和分类头均冻结。
+`--inject_target_expert` 允许恶意客户端偏离服务器分配，将目标专家强制放入目标层的 K 个上传槽位。初始阶段只训练目标专家，其他参数均冻结；服务器集中评估的 ASR 首次达到 `--inject_benign_train_asr_threshold`（默认 `0.95`）后，从下一个攻击轮次起恢复与良性客户端相同的模式训练规则，但仍使用投毒数据，并继续保证目标专家在分配列表中。
 
 目标可通过以下方式设置：
 
@@ -169,12 +169,17 @@ ASR 测试会排除真实标签已等于目标标签的样本，给其余测试�
 
 ### 6.5 当前预留但未接入的攻击参数
 
-以下参数目前可以被配置解析器接受并写入运行配置，但客户端训练代码尚未读取它们，因此不会改变训练行为：
+`--malicious_train_router` 会在定向专家注入期间联合训练目标层 router 的目标专家行。训练使用
+trigger-token logit margin loss，并在非 trigger token 上使用相对本轮入参 router 的 KL 保持损失；
+非目标行每步恢复，目标行更新被限制在配置的 L2 半径内。相关参数为：
 
-- `--malicious_train_router`
-- `--malicious_train_force_route`
+- `--malicious_router_loss_weight`
+- `--malicious_router_margin`
+- `--malicious_router_clean_kl_weight`
+- `--malicious_router_lr_scale`
+- `--malicious_router_max_update_norm`
 
-当前定向注入采用自然路由，并冻结 router；如需 router 联合训练或训练时强制路由，需要补充实现。
+`--malicious_train_force_route` 目前仍只被配置解析器接受，客户端训练尚未读取它。
 
 ## 7. 低频专家分析
 
@@ -352,7 +357,8 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | `--attack_end_round` | `0` | 攻击结束轮；0 表示不结束 |
 | `--malicious_lr` | `0` | 恶意学习率；0 表示沿用普通值 |
 | `--malicious_local_epochs` | `0` | 恶意本地 epoch；0 表示沿用普通值 |
-| `--inject_target_expert` | 关闭 | 强制目标专家进入恶意客户端分配并仅训练它 |
+| `--inject_target_expert` | 关闭 | 强制目标专家进入恶意客户端分配；达到 ASR 阈值前只训练目标专家 |
+| `--inject_benign_train_asr_threshold` | `0.95` | 定向注入达到该 ASR 后，下一轮起恶意客户端恢复当前模式的良性训练范围（旧参数名仍可作别名） |
 | `--lfe_target_layer` | 空 | 目标 MoE 层，如 `encoder.5` |
 | `--lfe_target_expert` | 空 | 目标专家编号 |
 | `--selected_triggers_path` | 空 | I-GCG 的 `selected_triggers.json` |
@@ -366,7 +372,7 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | `--init_checkpoint` | `--checkpoint_path` 的别名 |
 | `--lfe_profile_trainings` | 兼容参数；训练 hook 画像按每个参与轮次执行 |
 | `--lfe_calibration_samples` | 兼容参数；训练 hook 使用实际训练批次 |
-| `--malicious_train_router` | 已解析但尚未接入训练逻辑 |
+| `--malicious_train_router` | 定向注入时联合训练目标 router 行（margin + clean KL + L2 投影） |
 | `--malicious_train_force_route` | 已解析但尚未接入训练逻辑 |
 
 完整、实时的参数帮助可通过下列命令查看：

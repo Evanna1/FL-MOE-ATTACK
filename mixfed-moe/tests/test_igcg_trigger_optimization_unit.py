@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mixfedmoe_fl.igcg_trigger_optimization import (
+    aggregate_robust_metrics,
     compute_routing_objective,
     heldout_selection_key,
+    IGCGTriggerOptimizer,
     load_calibration_texts,
     parse_config,
+    robust_selection_key,
     split_calibration_texts,
     TriggerMetrics,
 )
@@ -54,6 +58,30 @@ def test_hit_rate_stopping_threshold_can_be_overridden() -> None:
     assert config.target_hit_rate_threshold == 0.97
 
 
+def test_config_accepts_robust_checkpoint_screening() -> None:
+    config = parse_config(
+        [
+            "--checkpoint_path",
+            "checkpoints/round01.pt",
+            "--robust_checkpoint_paths",
+            "checkpoints/round05.pt",
+            "checkpoints/round10.pt",
+            "--robust_margin_quantile",
+            "0.2",
+            "--target_layer",
+            "encoder.5",
+            "--target_expert",
+            "2",
+        ]
+    )
+
+    assert config.robust_checkpoint_paths == (
+        "checkpoints/round05.pt",
+        "checkpoints/round10.pt",
+    )
+    assert config.robust_margin_quantile == pytest.approx(0.2)
+
+
 def test_load_calibration_texts_reads_ag_news_rows(tmp_path) -> None:
     path = tmp_path / "calibration.json"
     path.write_text(json.dumps([{"text": "news one"}, {"text": "news two"}]), encoding="utf-8")
@@ -80,3 +108,63 @@ def test_heldout_selection_prioritizes_hit_rate_then_margin() -> None:
 
     assert heldout_selection_key(higher_hit) > heldout_selection_key(lower_hit)
     assert heldout_selection_key(same_hit_larger_margin) > heldout_selection_key(higher_hit)
+
+
+def test_robust_selection_prioritizes_worst_hit_then_margin_quantile() -> None:
+    high_average_fragile = aggregate_robust_metrics(
+        [
+            TriggerMetrics(0.1, 0.99, 0.99, 4.0),
+            TriggerMetrics(2.0, 0.40, 0.60, -1.0),
+        ],
+        margin_quantile=0.1,
+    )
+    stable = aggregate_robust_metrics(
+        [
+            TriggerMetrics(0.5, 0.85, 0.90, 1.0),
+            TriggerMetrics(0.6, 0.80, 0.88, 0.8),
+        ],
+        margin_quantile=0.1,
+    )
+    same_worst_hit_better_tail_margin = aggregate_robust_metrics(
+        [
+            TriggerMetrics(0.7, 0.75, 0.90, 1.2),
+            TriggerMetrics(0.8, 0.70, 0.88, 1.0),
+        ],
+        margin_quantile=0.1,
+    )
+
+    assert robust_selection_key(stable) > robust_selection_key(high_average_fragile)
+    assert robust_selection_key(same_worst_hit_better_tail_margin) > robust_selection_key(stable)
+    assert stable.low_quantile_margin == pytest.approx(0.82)
+
+
+def test_robust_evaluation_visits_all_checkpoints_and_restores_primary() -> None:
+    optimizer = object.__new__(IGCGTriggerOptimizer)
+    optimizer.checkpoint_paths = ("round01.pt", "round05.pt", "round10.pt")
+    optimizer.primary_checkpoint_path = "round01.pt"
+    optimizer.config = SimpleNamespace(robust_margin_quantile=0.1)
+    active = {"path": ""}
+    visits = []
+
+    def activate(path: str) -> None:
+        active["path"] = path
+        visits.append(path)
+
+    checkpoint_values = {
+        "round01.pt": (0.95, 1.0),
+        "round05.pt": (0.85, 0.4),
+        "round10.pt": (0.90, 0.8),
+    }
+
+    def evaluate_many(candidates, texts=None):
+        hit_rate, margin = checkpoint_values[active["path"]]
+        return [TriggerMetrics(0.5, 0.8, hit_rate, margin) for _ in candidates]
+
+    optimizer._activate_checkpoint = activate
+    optimizer.evaluate_many = evaluate_many
+
+    result = optimizer.evaluate_many_robust([[1, 2]], texts=["held-out"])[0]
+
+    assert visits == ["round01.pt", "round05.pt", "round10.pt", "round01.pt"]
+    assert result.worst_target_hit_rate == pytest.approx(0.85)
+    assert result.low_quantile_margin == pytest.approx(0.48)

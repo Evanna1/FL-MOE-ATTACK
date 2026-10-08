@@ -11,7 +11,7 @@ import torch
 from flwr.common import Code, FitRes, Parameters, Status, ndarrays_to_parameters, parameters_to_ndarrays
 
 from mixfedmoe_fl.config import MixFedMoEConfig
-from mixfedmoe_fl.strategy import MixFedMoEStrategy
+from mixfedmoe_fl.strategy import MixFedMoEStrategy, _array_update_l2
 
 
 @dataclass(frozen=True)
@@ -501,6 +501,98 @@ def test_defense_norm_clip_scales_large_update() -> None:
     param_contribs = {0: [("0", np.array([10.0], np.float32), 10.0)]}  # update norm 10 -> clipped to 1
     aggregated = strategy._defense_aggregate(baseline, param_contribs)
     assert np.allclose(aggregated[0], [1.0])
+
+
+def test_array_update_l2_uses_only_requested_parameter_indices() -> None:
+    before = [
+        np.array([3.0, 4.0], dtype=np.float32),
+        np.array([100.0], dtype=np.float32),
+    ]
+    after = [
+        np.array([6.0, 8.0], dtype=np.float32),
+        np.array([-900.0], dtype=np.float32),
+    ]
+
+    absolute, relative = _array_update_l2(before=before, after=after, indices=[0])
+
+    assert absolute == pytest.approx(5.0)
+    assert relative == pytest.approx(1.0)
+
+
+def test_aggregate_fit_reports_local_and_global_target_expert_updates() -> None:
+    strategy, _ = _build_strategy(mode="mix", num_clients=2, k=1)
+    strategy.runtime_config = replace(
+        strategy.runtime_config,
+        checkpoint_rounds=(),
+        lfe_target_layer="encoder.0",
+        lfe_target_expert=1,
+        malicious_clients=(0,),
+    )
+    strategy._current_global_arrays = _initial_arrays()
+    names = _parameter_names()
+    target_idx = names.index(
+        "encoder.block.0.layer.1.mlp.experts.expert_1.wi.weight"
+    )
+
+    malicious_arrays = _initial_arrays()
+    malicious_arrays[target_idx] = np.array([9.0], dtype=np.float32)
+    benign_arrays = _initial_arrays()
+    benign_arrays[names.index(
+        "encoder.block.0.layer.1.mlp.experts.expert_0.wi.weight"
+    )] = np.array([3.0], dtype=np.float32)
+
+    common_metrics = {
+        "mode": "mix",
+        "local_training_time": 0.1,
+        "returned_parameter_names_json": json.dumps(names),
+    }
+    results = [
+        (
+            DummyClientProxy(cid="0"),
+            _build_fit_res(
+                arrays=malicious_arrays,
+                num_examples=10,
+                metrics={
+                    **common_metrics,
+                    "client_id": 0,
+                    "is_malicious": True,
+                    "attack_active": True,
+                    "assigned_experts_json": json.dumps({"encoder.0": [1]}),
+                    "target_expert_local_update_l2": 4.0,
+                    "target_expert_local_relative_update_l2": 0.25,
+                },
+            ),
+        ),
+        (
+            DummyClientProxy(cid="1"),
+            _build_fit_res(
+                arrays=benign_arrays,
+                num_examples=10,
+                metrics={
+                    **common_metrics,
+                    "client_id": 1,
+                    "is_malicious": False,
+                    "attack_active": False,
+                    "assigned_experts_json": json.dumps({"encoder.0": [0]}),
+                },
+            ),
+        ),
+    ]
+
+    aggregated_parameters, metrics = strategy.aggregate_fit(
+        server_round=1,
+        results=results,  # type: ignore[arg-type]
+        failures=[],
+    )
+
+    assert aggregated_parameters is not None
+    aggregated = parameters_to_ndarrays(aggregated_parameters)
+    assert aggregated[target_idx][0] == pytest.approx(9.0)
+    assert float(metrics["target_expert_local_update_l2"]) == pytest.approx(4.0)
+    assert float(metrics["target_expert_local_relative_update_l2"]) == pytest.approx(0.25)
+    assert float(metrics["target_expert_global_update_l2"]) == pytest.approx(9.0)
+    assert int(metrics["target_expert_contributors"]) == 1
+    assert int(metrics["num_malicious_target_updates"]) == 1
 
 
 def test_defense_multi_krum_drops_outlier_client() -> None:

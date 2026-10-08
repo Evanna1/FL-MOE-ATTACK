@@ -105,6 +105,48 @@ def test_parse_config_accepts_badnet_options() -> None:
     assert cfg.checkpoint_rounds == (2, 4)
 
 
+def test_parse_config_accepts_localized_router_training_options(tmp_path) -> None:
+    path = tmp_path / "selected_triggers.json"
+    path.write_text(
+        '{"target":{"layer_id":"encoder.11","expert_id":0},'
+        '"best_trigger":{"trigger":"older WWII","trigger_token_ids":[2749,29420]}}',
+        encoding="utf-8",
+    )
+    cfg = parse_config(
+        [
+            "--mode",
+            "mix",
+            "--attack_enabled",
+            "--inject_target_expert",
+            "--malicious_train_router",
+            "--selected_triggers_path",
+            str(path),
+            "--malicious_router_loss_weight",
+            "0.75",
+            "--malicious_router_margin",
+            "3.5",
+            "--malicious_router_clean_kl_weight",
+            "0.2",
+            "--malicious_router_lr_scale",
+            "0.1",
+            "--malicious_router_max_update_norm",
+            "0.025",
+        ]
+    )
+
+    assert cfg.malicious_train_router is True
+    assert cfg.malicious_router_loss_weight == 0.75
+    assert cfg.malicious_router_margin == 3.5
+    assert cfg.malicious_router_clean_kl_weight == 0.2
+    assert cfg.malicious_router_lr_scale == 0.1
+    assert cfg.malicious_router_max_update_norm == 0.025
+
+
+def test_router_training_requires_localized_injection() -> None:
+    with pytest.raises(ValueError, match="requires --inject_target_expert"):
+        parse_config(["--mode", "mix", "--attack_enabled", "--malicious_train_router"])
+
+
 def test_parse_config_accepts_checkpoint_path_and_legacy_alias() -> None:
     cfg = parse_config(
         ["--mode", "full", "--attack_enabled", "--checkpoint_path", "trained.pt"]

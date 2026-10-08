@@ -19,15 +19,8 @@ class SelectedTrigger:
     target_expert: int
     trigger_token_ids: Tuple[int, ...] = ()
 
-
+# load a PyTorch checkpoint and return its state_dict and metadata.
 def load_attack_checkpoint(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-    """Load model weights used as the starting point for poisoning training.
-
-    Flower round checkpoints produced by this project wrap the weights in a
-    ``state_dict`` field.  ``model_state_dict`` and an unwrapped PyTorch state
-    dict are accepted as well so centrally trained checkpoints can be reused.
-    Only tensor-like state-dict values are accepted.
-    """
     checkpoint_path = Path(path).expanduser()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: '{checkpoint_path}'.")
@@ -71,9 +64,8 @@ def load_attack_checkpoint(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str
 
     return state_dict, metadata
 
-
+# Load the best low-frequency-expert trigger from selected_triggers.json.
 def load_selected_trigger(path: str) -> SelectedTrigger:
-    """Load the best low-frequency-expert trigger from selected_triggers.json."""
     trigger_path = Path(path)
     if not trigger_path.is_file():
         raise FileNotFoundError(f"selected_triggers.json not found: '{path}'.")
@@ -121,7 +113,7 @@ def add_trigger(text: str, trigger: str) -> str:
         raise ValueError("BadNet trigger must not be empty.")
     return f"{text.rstrip()} {clean_trigger}"
 
-# Select a deterministic subset of local example indices for poisoning.
+# Select a subset of local example indices for poisoning.(选择哪些样本要投毒)
 def select_poison_indices(
     num_examples: int,
     poison_rate: float,
@@ -153,7 +145,7 @@ def select_poison_indices(
     selected = rng.choice(candidates, size=num_poisoned, replace=False)
     return sorted(int(idx) for idx in selected.tolist())
 
-# Apply standard BadNet poisoning to a text/label HuggingFace Dataset.
+# Apply standard BadNet poisoning to a text/label HuggingFace Dataset.(加trigger变成投毒样本)
 def poison_text_classification_dataset(
     dataset: Dataset,
     poison_rate: float,

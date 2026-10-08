@@ -316,6 +316,57 @@ class MoeHandle:
     gate_linear_path: Optional[str]
 
 
+class TriggerRouterLoss:
+    """Supervise natural router logits at exact trigger token occurrences."""
+
+    def __init__(self, classifier: nn.Module, token_ids: Sequence[int], target: int, decoder: bool):
+        self.token_ids = tuple(token_ids)
+        if not self.token_ids:
+            raise ValueError("Router training requires non-empty trigger token IDs.")
+        self.target = target
+        self.decoder = decoder
+        self.mask: Optional[torch.Tensor] = None
+        self.logits: Optional[torch.Tensor] = None
+        self.hook = classifier.register_forward_hook(self._capture)
+
+    def _capture(self, module, inputs, output):
+        self.logits = output
+
+    def begin_batch(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+        mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        width = len(self.token_ids)
+        if input_ids.shape[1] >= width:
+            windows = input_ids.unfold(1, width, 1)
+            trigger = input_ids.new_tensor(self.token_ids)
+            matches = (windows == trigger).all(-1)
+            matches &= attention_mask.bool().unfold(1, width, 1).all(-1)
+            for offset in range(width):
+                mask[:, offset:offset + matches.shape[1]] |= matches
+        if self.decoder:
+            shifted = torch.zeros_like(mask)
+            shifted[:, 1:] = mask[:, :-1]
+            mask = shifted
+        self.mask = mask
+        self.logits = None
+
+    def loss(self) -> torch.Tensor:
+        if self.logits is None or self.mask is None:
+            raise RuntimeError("Target router did not run during training forward.")
+        logits = self.logits.reshape(-1, self.logits.shape[-1])
+        mask = self.mask.reshape(-1)
+        if logits.shape[0] != mask.numel():
+            raise RuntimeError("Target router token shape does not match trigger mask.")
+        if not mask.any():
+            return logits.sum() * 0.0
+        selected = logits[mask].float()
+        targets = torch.full((selected.shape[0],), self.target, device=selected.device, dtype=torch.long)
+        return nn.functional.cross_entropy(selected, targets)
+
+    def close(self):
+        self.hook.remove()
+        self.logits = None
+
+
 def collect_moe_handles(model: nn.Module) -> List[MoeHandle]:
     if not hasattr(model, "encoder") or not hasattr(model, "decoder"):
         raise RuntimeError("SwitchTransformer structure not found: expected model.encoder/model.decoder stacks.")
@@ -917,6 +968,7 @@ class MixFedMoEClient(NumPyClient):
         optimizer: Optional[AdamW] = None
         train_loader: Optional[DataLoader] = None
         lfe_tracker: Optional[TrainingLFERoutingTracker] = None
+        router_objective: Optional[TriggerRouterLoss] = None
         try:
             mode = _as_str(config, "mode", self.runtime_config.mode).lower()
             if mode not in {"full", "mix", "drop", "flex"}:
@@ -966,35 +1018,50 @@ class MixFedMoEClient(NumPyClient):
             else:
                 apply_mode_drop(model=model, moe_handles=base_moe_handles, layer_hot_map=assignments)
 
-            if (
-                attack_active
-                and self.runtime_config.inject_target_expert
-                and self.runtime_config.lfe_target_layer is not None
-                and self.runtime_config.lfe_target_expert is not None
-            ):
-                # Localized injection: train ONLY the target expert. The router stays frozen,
-                # so poison examples reach this expert solely through their trigger's natural
-                # top-1 routing. The head and all other parameters remain frozen as well.
-                stack_name, block_idx = self.runtime_config.lfe_target_layer.split(".")
-                layer_marker = f"{stack_name}.block.{block_idx}.layer"
-                expert_marker = f".experts.expert_{int(self.runtime_config.lfe_target_expert)}."
-                kept = 0
-                for name, param in model.named_parameters():
-                    in_layer = name.startswith(f"{stack_name}.") and layer_marker in name
-                    keep_expert = in_layer and expert_marker in name
-                    param.requires_grad_(keep_expert)
-                    kept += int(keep_expert)
-                if kept == 0:
-                    raise RuntimeError(
-                        f"Localized injection found no trainable params for expert "
-                        f"{self.runtime_config.lfe_target_expert}@{self.runtime_config.lfe_target_layer}."
-                    )
-                print(
-                    f"[MixFedMoE][client={self.client_id}] localized injection: training expert "
-                    f"{self.runtime_config.lfe_target_expert}@{self.runtime_config.lfe_target_layer}"
-                    f" with natural routing ({kept} tensors), rest frozen",
-                    flush=True,
-                )
+            # if (
+            #     attack_active
+            #     and self.runtime_config.inject_target_expert
+            #     and self.runtime_config.lfe_target_layer is not None
+            #     and self.runtime_config.lfe_target_expert is not None
+            # ):
+            #     # Localized injection; optionally supervise the target-layer router.
+            #     stack_name, block_idx = self.runtime_config.lfe_target_layer.split(".")
+            #     layer_marker = f"{stack_name}.block.{block_idx}.layer"
+            #     expert_marker = f".experts.expert_{int(self.runtime_config.lfe_target_expert)}."
+            #     kept = 0
+            #     for name, param in model.named_parameters():
+            #         in_layer = name.startswith(f"{stack_name}.") and layer_marker in name
+            #         keep_expert = in_layer and expert_marker in name
+            #         param.requires_grad_(keep_expert)
+            #         kept += int(keep_expert)
+            #     if kept == 0:
+            #         raise RuntimeError(
+            #             f"Localized injection found no trainable params for expert "
+            #             f"{self.runtime_config.lfe_target_expert}@{self.runtime_config.lfe_target_layer}."
+            #         )
+            #     if self.runtime_config.malicious_train_router:
+            #         handle = next(h for h in collect_moe_handles(model)
+            #                       if h.layer_id == self.runtime_config.lfe_target_layer)
+            #         if not handle.gate_linear_path:
+            #             raise RuntimeError("Target router classifier was not found.")
+            #         gate = get_submodule_by_path(handle.mlp_module, handle.gate_linear_path)
+            #         gate.requires_grad_(True)
+            #         token_ids = self.runtime_config.trigger_token_ids
+            #         if not token_ids:
+            #             token_ids = self.data_manager.tokenizer.encode(
+            #                 self.runtime_config.trigger, add_special_tokens=False)
+            #         target = int(self.runtime_config.lfe_target_expert)
+            #         if mode == "drop":
+            #             target = assignments[handle.layer_id].index(target)
+            #         router_objective = TriggerRouterLoss(
+            #             gate, token_ids, target, handle.stack_name == "decoder")
+            #     print(
+            #         f"[MixFedMoE][client={self.client_id}] localized injection: training expert "
+            #         f"{self.runtime_config.lfe_target_expert}@{self.runtime_config.lfe_target_layer}"
+            #         f" with natural routing ({kept} expert tensors), "
+            #         f"train_router={router_objective is not None}",
+            #         flush=True,
+            #     )
 
             local_epochs = _as_float(config, "local_epochs", self.runtime_config.local_epochs)
             learning_rate = _as_float(config, "learning_rate", self.runtime_config.learning_rate)
@@ -1084,6 +1151,8 @@ class MixFedMoEClient(NumPyClient):
                         lfe_tracker.begin_batch(attention_mask)
 
                     optimizer.zero_grad(set_to_none=True)
+                    if router_objective is not None:
+                        router_objective.begin_batch(input_ids, attention_mask)
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -1094,12 +1163,16 @@ class MixFedMoEClient(NumPyClient):
                     loss = outputs.loss
                     if loss is None:
                         raise RuntimeError("Model forward returned loss=None during training.")
-                    loss.backward()
+                    if router_objective is not None:
+                        loss = loss + router_objective.loss()
+                    if loss.requires_grad:
+                        loss.backward()
                     if neurotoxin_mask is not None:
                         for name, param in model.named_parameters():
                             if param.requires_grad and param.grad is not None and name in neurotoxin_mask:
                                 param.grad.mul_(neurotoxin_mask[name])
-                    optimizer.step()
+                    if loss.requires_grad:
+                        optimizer.step()
 
                     total_loss += float(loss.item()) * batch_size
                     total_examples += batch_size
@@ -1209,6 +1282,8 @@ class MixFedMoEClient(NumPyClient):
             }
             return outbound, total_examples, metrics
         finally:
+            if router_objective is not None:
+                router_objective.close()
             if lfe_tracker is not None:
                 lfe_tracker.close()
             if optimizer is not None:

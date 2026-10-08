@@ -18,7 +18,16 @@ def test_build_timestamped_output_dir() -> None:
 
 def test_attack_results_csv_is_created_and_logged(tmp_path) -> None:
     logger = RoundMetricsLogger(str(tmp_path))
-    logger.log_round({"round": 1, "clean_accuracy": 0.75, "asr": 0.5})
+    logger.log_round(
+        {
+            "round": 1,
+            "clean_accuracy": 0.75,
+            "asr": 0.5,
+            "target_expert_local_update_l2": 0.4,
+            "target_expert_global_update_l2": 0.1,
+            "target_expert_contributors": 5,
+        }
+    )
 
     with open(logger.attack_csv_path, encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -31,6 +40,12 @@ def test_attack_results_csv_is_created_and_logged(tmp_path) -> None:
             "trigger_target_hit_rate": "",
             "trigger_target_execution_rate": "",
             "trigger_routing_tokens": "",
+            "target_expert_local_update_l2": "0.4",
+            "target_expert_local_relative_update_l2": "",
+            "target_expert_global_update_l2": "0.1",
+            "target_expert_global_relative_update_l2": "",
+            "target_expert_contributors": "5",
+            "num_malicious_target_updates": "",
         }
     ]
 

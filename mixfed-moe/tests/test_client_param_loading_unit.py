@@ -5,7 +5,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from mixfedmoe_fl.client import _compute_target_train_steps, _load_from_numpy_ndarrays, _state_dict_names
+from mixfedmoe_fl.client import (
+    _compute_target_train_steps,
+    _load_from_numpy_ndarrays,
+    _parameter_update_l2,
+    _state_dict_names,
+    _target_expert_parameter_snapshot,
+)
 
 
 def _build_model() -> nn.Module:
@@ -72,3 +78,44 @@ def test_compute_target_train_steps_supports_fractional_epochs() -> None:
 def test_compute_target_train_steps_requires_non_empty_dataloader() -> None:
     with pytest.raises(ValueError, match="steps_per_epoch must be > 0"):
         _compute_target_train_steps(local_epochs=0.5, steps_per_epoch=0)
+
+
+class _TinyExpertModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Module()
+        self.encoder.block = nn.ModuleList([nn.Identity() for _ in range(12)])
+        target_block = nn.Module()
+        target_block.layer = nn.ModuleList([nn.Module()])
+        target_block.layer[0].mlp = nn.Module()
+        target_block.layer[0].mlp.experts = nn.ModuleDict(
+            {
+                "expert_2": nn.Linear(2, 2, bias=False),
+                "expert_3": nn.Linear(2, 2, bias=False),
+            }
+        )
+        self.encoder.block[11] = target_block
+
+
+def test_target_expert_snapshot_measures_only_selected_expert_update() -> None:
+    model = _TinyExpertModel()
+    with torch.no_grad():
+        model.encoder.block[11].layer[0].mlp.experts["expert_2"].weight.fill_(2.0)
+        model.encoder.block[11].layer[0].mlp.experts["expert_3"].weight.fill_(3.0)
+
+    snapshot = _target_expert_parameter_snapshot(
+        model=model,
+        layer_id="encoder.11",
+        expert_idx=2,
+    )
+    assert list(snapshot) == [
+        "encoder.block.11.layer.0.mlp.experts.expert_2.weight"
+    ]
+
+    with torch.no_grad():
+        model.encoder.block[11].layer[0].mlp.experts["expert_2"].weight.add_(1.0)
+        model.encoder.block[11].layer[0].mlp.experts["expert_3"].weight.add_(100.0)
+
+    absolute, relative = _parameter_update_l2(model=model, before=snapshot)
+    assert absolute == pytest.approx(2.0)
+    assert relative == pytest.approx(0.5)

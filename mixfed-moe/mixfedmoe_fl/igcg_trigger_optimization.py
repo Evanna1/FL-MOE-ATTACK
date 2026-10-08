@@ -22,6 +22,8 @@ class IGCGTriggerConfig:
     checkpoint_path: str
     target_layer: str
     target_expert: int
+    robust_checkpoint_paths: Tuple[str, ...] = ()
+    robust_margin_quantile: float = 0.1
     model_name_or_path: str = "model_ckpt/switch-base-8"
     trigger_length: int = 10
     initial_trigger: Optional[str] = None
@@ -64,6 +66,17 @@ class TriggerMetrics:
 
 
 @dataclass(frozen=True)
+class RobustTriggerMetrics:
+    """Aggregate one trigger's metrics over a checkpoint ensemble."""
+
+    mean: TriggerMetrics
+    worst_target_probability: float
+    worst_target_hit_rate: float
+    low_quantile_margin: float
+    per_checkpoint: Tuple[TriggerMetrics, ...]
+
+
+@dataclass(frozen=True)
 class TriggerRecord:
     iteration: int
     trigger_ids: List[int]
@@ -73,10 +86,16 @@ class TriggerRecord:
     target_expert_hit_rate: float
     target_expert_margin: float
     accepted_mutations: int
+    robust_worst_target_probability: Optional[float] = None
+    robust_worst_target_hit_rate: Optional[float] = None
+    robust_low_quantile_margin: Optional[float] = None
     heldout_routing_loss: Optional[float] = None
     heldout_target_probability: Optional[float] = None
     heldout_target_hit_rate: Optional[float] = None
     heldout_target_margin: Optional[float] = None
+    heldout_robust_worst_target_probability: Optional[float] = None
+    heldout_robust_worst_target_hit_rate: Optional[float] = None
+    heldout_robust_low_quantile_margin: Optional[float] = None
 
 
 def heldout_selection_key(metrics: TriggerMetrics) -> Tuple[float, float, float, float]:
@@ -89,6 +108,46 @@ def heldout_selection_key(metrics: TriggerMetrics) -> Tuple[float, float, float,
     )
 
 
+def aggregate_robust_metrics(
+    metrics: Sequence[TriggerMetrics], margin_quantile: float
+) -> RobustTriggerMetrics:
+    """Aggregate checkpoint metrics without hiding the weakest router state."""
+    if not metrics:
+        raise ValueError("At least one checkpoint metric is required.")
+    if not 0.0 <= margin_quantile <= 1.0:
+        raise ValueError("margin_quantile must be in [0, 1].")
+
+    count = float(len(metrics))
+    mean = TriggerMetrics(
+        sum(item.loss for item in metrics) / count,
+        sum(item.target_probability for item in metrics) / count,
+        sum(item.target_hit_rate for item in metrics) / count,
+        sum(item.target_margin for item in metrics) / count,
+    )
+    margins = torch.tensor([item.target_margin for item in metrics], dtype=torch.float64)
+    return RobustTriggerMetrics(
+        mean=mean,
+        worst_target_probability=min(item.target_probability for item in metrics),
+        worst_target_hit_rate=min(item.target_hit_rate for item in metrics),
+        low_quantile_margin=float(torch.quantile(margins, margin_quantile)),
+        per_checkpoint=tuple(metrics),
+    )
+
+
+def robust_selection_key(
+    metrics: RobustTriggerMetrics,
+) -> Tuple[float, float, float, float, float, float]:
+    """Prefer worst-checkpoint hit rate, then low-quantile routing margin."""
+    return (
+        metrics.worst_target_hit_rate,
+        metrics.low_quantile_margin,
+        metrics.mean.target_hit_rate,
+        metrics.mean.target_margin,
+        metrics.mean.target_probability,
+        -metrics.mean.loss,
+    )
+
+# Return loss, target probability, Top-1 hit rate, and target logit margin.
 def compute_routing_objective(
     router_logits: torch.Tensor,
     trigger_mask: torch.Tensor,
@@ -98,7 +157,6 @@ def compute_routing_objective(
     margin_weight: float = 0.0,
     eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return loss, target probability, Top-1 hit rate, and target logit margin."""
     if router_logits.ndim == 2:
         if router_logits.shape[0] != trigger_mask.numel():
             raise ValueError("Flattened router logits and trigger mask have different token counts.")
@@ -127,7 +185,7 @@ def compute_routing_objective(
     hit_rate = logits.argmax(dim=-1).eq(target_expert).float().mean()
     return loss, target_probabilities.mean(), hit_rate, logit_margin.mean()
 
-
+# Rank replacement tokens by first-order loss change for I-GCG proposals.
 def top_k_tokens_from_gradient(
     current_ids: Sequence[int],
     position: int,
@@ -136,7 +194,6 @@ def top_k_tokens_from_gradient(
     top_k: int,
     excluded_ids: Iterable[int] = (),
 ) -> List[int]:
-    """Rank replacement tokens by the first-order loss change used by GCG."""
     if not 0 <= position < len(current_ids):
         raise IndexError("Trigger position is out of range.")
     row_gradient = gradient[position] if gradient.ndim == 2 else gradient
@@ -153,14 +210,13 @@ def top_k_tokens_from_gradient(
         raise ValueError(f"No valid replacement token remains at trigger position {position}.")
     return torch.topk(scores, k=count, largest=False).indices.cpu().tolist()
 
-
+# Sample single-coordinate proposals for I-GCG cumulative merging.
 def sample_single_coordinate_candidates(
     current_ids: Sequence[int],
     candidates_by_position: Sequence[Sequence[int]],
     batch_size: int,
     rng: random.Random,
 ) -> List[List[int]]:
-    """Sample one-token mutations across coordinates as in the original GCG."""
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0.")
     if len(candidates_by_position) != len(current_ids):
@@ -178,15 +234,12 @@ def sample_single_coordinate_candidates(
         generated.append(candidate)
     return generated
 
-
+# Canonicalize candidates through text and reject unstable tokenizations.
 def filter_roundtrip_candidates(
     tokenizer: PreTrainedTokenizerBase,
     current_ids: Sequence[int],
     candidates: Sequence[Sequence[int]],
-    *,
-    require_single_coordinate: bool,
 ) -> List[List[int]]:
-    """Canonicalize candidates through text and reject unstable tokenizations."""
     expected_length = len(current_ids)
     filtered: List[List[int]] = []
     seen = set()
@@ -199,23 +252,19 @@ def filter_roundtrip_candidates(
         encoded = list(tokenizer(text, add_special_tokens=False)["input_ids"])
         if len(encoded) != expected_length or encoded == list(current_ids):
             continue
-        changed = sum(old != new for old, new in zip(current_ids, encoded))
-        if require_single_coordinate and changed != 1:
-            continue
         key = tuple(int(token_id) for token_id in encoded)
         if key not in seen:
             seen.add(key)
             filtered.append(list(key))
     return filtered
 
-
+# I-GCG cumulative merge of the best round-trip-stable candidates.
 def combine_top_single_coordinate_candidates(
     current_ids: Sequence[int],
     candidates: Sequence[Sequence[int]],
     losses: Sequence[float],
     top_p: int,
 ) -> List[List[int]]:
-    """I-GCG cumulative merge of the best round-trip-stable candidates."""
     if len(candidates) != len(losses):
         raise ValueError("candidates and losses must have equal length.")
     if top_p <= 0:
@@ -240,9 +289,8 @@ def combine_top_single_coordinate_candidates(
             output.append(list(merged))
     return output
 
-
+# Select the first ranked low-frequency expert from an LFE profile.
 def select_low_frequency_target(profile_path: str, layer_id: str) -> int:
-    """Select the first ranked low-frequency expert from an LFE profile."""
     payload = json.loads(Path(profile_path).read_text(encoding="utf-8"))
     try:
         experts = payload["layers"][layer_id]["top_low_frequency_experts"]
@@ -257,12 +305,53 @@ def select_low_frequency_target(profile_path: str, layer_id: str) -> int:
 
 
 def _load_checkpoint(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint_path = Path(path).expanduser()
+    if not checkpoint_path.is_file() and not checkpoint_path.is_absolute():
+        repository_relative = Path(__file__).resolve().parent.parent / checkpoint_path
+        if repository_relative.is_file():
+            checkpoint_path = repository_relative
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: '{path}'.")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
         return dict(payload["state_dict"]), {k: v for k, v in payload.items() if k != "state_dict"}
     if isinstance(payload, dict) and payload and all(torch.is_tensor(v) for v in payload.values()):
         return dict(payload), {}
     raise ValueError("Checkpoint must be a state_dict or contain a 'state_dict' object.")
+
+
+def _load_state_into_model(model: nn.Module, checkpoint_path: str) -> Dict[str, Any]:
+    state, metadata = _load_checkpoint(checkpoint_path)
+    incompatible = model.load_state_dict(state, strict=False)
+    missing = [name for name in incompatible.missing_keys if not name.endswith("position_ids")]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint '{checkpoint_path}' mismatch: missing={missing[:10]}, "
+            f"unexpected={incompatible.unexpected_keys[:10]}."
+        )
+    return metadata
+
+
+def resolve_checkpoint_ensemble(
+    primary_path: str, robust_paths: Sequence[str]
+) -> Tuple[str, ...]:
+    """Return primary + robust checkpoints in order, with duplicates removed."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for raw_path in (primary_path, *robust_paths):
+        checkpoint_path = Path(raw_path).expanduser()
+        if not checkpoint_path.is_file() and not checkpoint_path.is_absolute():
+            repository_relative = Path(__file__).resolve().parent.parent / checkpoint_path
+            if repository_relative.is_file():
+                checkpoint_path = repository_relative
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: '{raw_path}'.")
+        resolved = str(checkpoint_path.resolve())
+        key = resolved.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(resolved)
+    return tuple(result)
 
 
 def load_victim_model(
@@ -386,11 +475,10 @@ def load_calibration_texts(path: str, limit: int) -> List[str]:
         raise ValueError("Calibration rows must contain non-empty 'text' strings.")
     return [str(text) for text in texts[:limit]]
 
-
+# Deterministically split calibration contexts into search and held-out sets.
 def split_calibration_texts(
     texts: Sequence[str], heldout_samples: int, seed: int
 ) -> Tuple[List[str], List[str]]:
-    """Deterministically split calibration contexts into search and held-out sets."""
     if heldout_samples <= 0:
         raise ValueError("heldout_samples must be > 0.")
     if len(texts) <= heldout_samples:
@@ -430,6 +518,16 @@ class IGCGTriggerOptimizer:
         self.rng = random.Random(config.seed)
         self.records: List[TriggerRecord] = []
         self.heldout_evaluations: List[Dict[str, Any]] = []
+        self.checkpoint_paths = resolve_checkpoint_ensemble(
+            config.checkpoint_path, config.robust_checkpoint_paths
+        )
+        self.primary_checkpoint_path = self.checkpoint_paths[0]
+        self.robust_screening_enabled = len(self.checkpoint_paths) > 1
+
+    def _activate_checkpoint(self, checkpoint_path: str) -> Dict[str, Any]:
+        metadata = _load_state_into_model(self.model, checkpoint_path)
+        self.model.eval().requires_grad_(False)
+        return metadata
 
     def _prepare(self, prompts: Sequence[str], trigger_ids: Sequence[int]) -> PreparedBatch:
         batch = build_triggered_batch(
@@ -553,15 +651,22 @@ class IGCGTriggerOptimizer:
             raise FloatingPointError("Non-finite trigger gradient.")
         return result
 
-    def evaluate_many(self, candidates: Sequence[Sequence[int]]) -> List[TriggerMetrics]:
+    def evaluate_many(
+        self,
+        candidates: Sequence[Sequence[int]],
+        texts: Optional[Sequence[str]] = None,
+    ) -> List[TriggerMetrics]:
         if not candidates:
             raise ValueError("At least one candidate trigger is required.")
+        evaluation_texts = list(self.texts if texts is None else texts)
+        if not evaluation_texts:
+            raise ValueError("Evaluation texts must not be empty.")
         loss_sums = [0.0] * len(candidates)
         probability_sums = [0.0] * len(candidates)
         hit_sums = [0.0] * len(candidates)
         margin_sums = [0.0] * len(candidates)
         counts = [0] * len(candidates)
-        pairs = [(index, text) for index in range(len(candidates)) for text in self.texts]
+        pairs = [(index, text) for index in range(len(candidates)) for text in evaluation_texts]
         with torch.no_grad():
             for start in range(0, len(pairs), self.config.evaluation_batch_size):
                 chunk = pairs[start : start + self.config.evaluation_batch_size]
@@ -601,6 +706,30 @@ class IGCGTriggerOptimizer:
                 margin_sums[index] / counts[index],
             )
             for index in range(len(candidates))
+        ]
+
+    def evaluate_many_robust(
+        self,
+        candidates: Sequence[Sequence[int]],
+        texts: Optional[Sequence[str]] = None,
+    ) -> List[RobustTriggerMetrics]:
+        """Evaluate every candidate on every configured benign checkpoint."""
+        per_candidate: List[List[TriggerMetrics]] = [[] for _ in candidates]
+        if not per_candidate:
+            raise ValueError("At least one candidate trigger is required.")
+        try:
+            for checkpoint_path in self.checkpoint_paths:
+                self._activate_checkpoint(checkpoint_path)
+                checkpoint_metrics = self.evaluate_many(candidates, texts=texts)
+                for index, metrics in enumerate(checkpoint_metrics):
+                    per_candidate[index].append(metrics)
+        finally:
+            # Gradients and token proposals always continue from the designated
+            # primary checkpoint, regardless of screening order or exceptions.
+            self._activate_checkpoint(self.primary_checkpoint_path)
+        return [
+            aggregate_robust_metrics(metrics, self.config.robust_margin_quantile)
+            for metrics in per_candidate
         ]
 
     def _stable_text_ids(self, text: str) -> List[int]:
@@ -664,7 +793,14 @@ class IGCGTriggerOptimizer:
             )
         return ids
 
-    def _record(self, iteration: int, ids: Sequence[int], metrics: TriggerMetrics, mutations: int):
+    def _record(
+        self,
+        iteration: int,
+        ids: Sequence[int],
+        metrics: TriggerMetrics,
+        mutations: int,
+        robust: Optional[RobustTriggerMetrics] = None,
+    ) -> TriggerRecord:
         record = TriggerRecord(
             iteration,
             list(ids),
@@ -674,12 +810,29 @@ class IGCGTriggerOptimizer:
             metrics.target_hit_rate,
             metrics.target_margin,
             mutations,
+            robust_worst_target_probability=(
+                robust.worst_target_probability if robust is not None else None
+            ),
+            robust_worst_target_hit_rate=(
+                robust.worst_target_hit_rate if robust is not None else None
+            ),
+            robust_low_quantile_margin=(
+                robust.low_quantile_margin if robust is not None else None
+            ),
         )
         self.records.append(record)
+        robust_summary = ""
+        if robust is not None:
+            robust_summary = (
+                f" worst_p={robust.worst_target_probability:.4f} "
+                f"worst_hit={robust.worst_target_hit_rate:.4f} "
+                f"q{self.config.robust_margin_quantile:g}_margin="
+                f"{robust.low_quantile_margin:.4f}"
+            )
         print(
             f"[I-GCG {iteration:03d}] loss={metrics.loss:.6f} "
             f"p(target)={metrics.target_probability:.4f} hit_rate={metrics.target_hit_rate:.4f} "
-            f"margin={metrics.target_margin:.4f} "
+            f"margin={metrics.target_margin:.4f}{robust_summary} "
             f"mutations={mutations} trigger={record.trigger_text!r}",
             flush=True,
         )
@@ -687,8 +840,14 @@ class IGCGTriggerOptimizer:
 
     def optimize(self) -> TriggerRecord:
         current = self._initial_ids()
-        current_metrics = self.evaluate(current)
-        best = self._record(0, current, current_metrics, 0)
+        current_robust: Optional[RobustTriggerMetrics] = None
+        if self.robust_screening_enabled:
+            current_robust = self.evaluate_many_robust([current])[0]
+            current_metrics = current_robust.mean
+        else:
+            current_metrics = self.evaluate(current)
+        best = self._record(0, current, current_metrics, 0, current_robust)
+        best_robust = current_robust
         excluded = set(self.tokenizer.all_special_ids)
         for iteration in range(1, self.config.iterations + 1):
             gradient = self.gradient(current)
@@ -705,48 +864,89 @@ class IGCGTriggerOptimizer:
                 self.tokenizer,
                 current,
                 sampled_singles,
-                require_single_coordinate=False,
             )
             if not singles:
                 raise RuntimeError(
                     "All sampled candidates changed token length after decode/encode. "
                     "Increase candidate_batch_size or top_k."
                 )
-            single_metrics = self.evaluate_many(singles)
+            if self.robust_screening_enabled:
+                single_robust = self.evaluate_many_robust(singles)
+                ranked_indices = sorted(
+                    range(len(singles)),
+                    key=lambda idx: robust_selection_key(single_robust[idx]),
+                    reverse=True,
+                )
+                single_ranks = [0.0] * len(singles)
+                for rank, index in enumerate(ranked_indices):
+                    single_ranks[index] = float(rank)
+            else:
+                single_metrics = self.evaluate_many(singles)
+                single_ranks = [metrics.loss for metrics in single_metrics]
             combined = combine_top_single_coordinate_candidates(
                 current,
                 singles,
-                [metrics.loss for metrics in single_metrics],
+                single_ranks,
                 self.config.combine_top_p,
             )
             combined = filter_roundtrip_candidates(
                 self.tokenizer,
                 current,
                 combined,
-                require_single_coordinate=False,
             )
             if not combined:
                 raise RuntimeError(
                     "All combined I-GCG candidates changed token length after decode/encode."
                 )
-            combined_metrics = self.evaluate_many(combined)
-            selected = min(range(len(combined)), key=lambda idx: combined_metrics[idx].loss)
-            candidate, candidate_metrics = combined[selected], combined_metrics[selected]
+            candidate_robust: Optional[RobustTriggerMetrics] = None
+            if self.robust_screening_enabled:
+                combined_robust = self.evaluate_many_robust(combined)
+                selected_index = max(
+                    range(len(combined)),
+                    key=lambda idx: robust_selection_key(combined_robust[idx]),
+                )
+                candidate_robust = combined_robust[selected_index]
+                candidate_metrics = candidate_robust.mean
+            else:
+                combined_metrics = self.evaluate_many(combined)
+                selected_index = min(
+                    range(len(combined)), key=lambda idx: combined_metrics[idx].loss
+                )
+                candidate_metrics = combined_metrics[selected_index]
+            candidate = combined[selected_index]
             mutations = sum(left != right for left, right in zip(current, candidate))
             current, current_metrics = list(candidate), candidate_metrics
-            record = self._record(iteration, current, current_metrics, mutations)
-            if record.routing_loss < best.routing_loss:
-                best = record
+            current_robust = candidate_robust
+            record = self._record(iteration, current, current_metrics, mutations, current_robust)
+            if current_robust is not None:
+                if best_robust is None or robust_selection_key(current_robust) > robust_selection_key(
+                    best_robust
+                ):
+                    best, best_robust = record, current_robust
+                search_probability = current_robust.worst_target_probability
+                search_hit_rate = current_robust.worst_target_hit_rate
+            else:
+                if record.routing_loss < best.routing_loss:
+                    best = record
+                search_probability = current_metrics.target_probability
+                search_hit_rate = current_metrics.target_hit_rate
             if (
-                current_metrics.target_probability >= self.config.target_probability_threshold
-                and current_metrics.target_hit_rate >= self.config.target_hit_rate_threshold
+                search_probability >= self.config.target_probability_threshold
+                and search_hit_rate >= self.config.target_hit_rate_threshold
             ):
-                heldout_metrics = self.evaluate(record.trigger_ids, self.heldout_texts)
+                if self.robust_screening_enabled:
+                    heldout_robust = self.evaluate_many_robust(
+                        [record.trigger_ids], texts=self.heldout_texts
+                    )[0]
+                    heldout_probability = heldout_robust.worst_target_probability
+                    heldout_hit_rate = heldout_robust.worst_target_hit_rate
+                else:
+                    heldout_metrics = self.evaluate(record.trigger_ids, self.heldout_texts)
+                    heldout_probability = heldout_metrics.target_probability
+                    heldout_hit_rate = heldout_metrics.target_hit_rate
                 if (
-                    heldout_metrics.target_probability
-                    >= self.config.target_probability_threshold
-                    and heldout_metrics.target_hit_rate
-                    >= self.config.target_hit_rate_threshold
+                    heldout_probability >= self.config.target_probability_threshold
+                    and heldout_hit_rate >= self.config.target_hit_rate_threshold
                 ):
                     break
         unique_records: Dict[Tuple[int, ...], TriggerRecord] = {}
@@ -756,8 +956,64 @@ class IGCGTriggerOptimizer:
             if previous is None or candidate_record.routing_loss < previous.routing_loss:
                 unique_records[key] = candidate_record
 
+        candidate_records = list(unique_records.values())
+        if self.robust_screening_enabled:
+            robust_heldout = self.evaluate_many_robust(
+                [record.trigger_ids for record in candidate_records], texts=self.heldout_texts
+            )
+            robust_evaluated = list(zip(candidate_records, robust_heldout))
+            for candidate_record, heldout in robust_evaluated:
+                self.heldout_evaluations.append(
+                    {
+                        "iteration": candidate_record.iteration,
+                        "trigger_ids": candidate_record.trigger_ids,
+                        "trigger_text": candidate_record.trigger_text,
+                        "mean": asdict(heldout.mean),
+                        "worst_target_probability": heldout.worst_target_probability,
+                        "worst_target_hit_rate": heldout.worst_target_hit_rate,
+                        "low_quantile_margin": heldout.low_quantile_margin,
+                        "per_checkpoint": [
+                            {"checkpoint_path": path, **asdict(metrics)}
+                            for path, metrics in zip(
+                                self.checkpoint_paths, heldout.per_checkpoint
+                            )
+                        ],
+                    }
+                )
+            best_record, robust_heldout_metrics = max(
+                robust_evaluated,
+                key=lambda item: robust_selection_key(item[1]),
+            )
+            heldout = robust_heldout_metrics.mean
+            selected = replace(
+                best_record,
+                heldout_routing_loss=heldout.loss,
+                heldout_target_probability=heldout.target_probability,
+                heldout_target_hit_rate=heldout.target_hit_rate,
+                heldout_target_margin=heldout.target_margin,
+                heldout_robust_worst_target_probability=(
+                    robust_heldout_metrics.worst_target_probability
+                ),
+                heldout_robust_worst_target_hit_rate=(
+                    robust_heldout_metrics.worst_target_hit_rate
+                ),
+                heldout_robust_low_quantile_margin=(
+                    robust_heldout_metrics.low_quantile_margin
+                ),
+            )
+            print(
+                "[I-GCG robust held-out selection] "
+                f"worst_hit={robust_heldout_metrics.worst_target_hit_rate:.4f} "
+                f"q{self.config.robust_margin_quantile:g}_margin="
+                f"{robust_heldout_metrics.low_quantile_margin:.4f} "
+                f"mean_hit={heldout.target_hit_rate:.4f} "
+                f"mean_p={heldout.target_probability:.4f} trigger={selected.trigger_text!r}",
+                flush=True,
+            )
+            return selected
+
         evaluated: List[Tuple[TriggerRecord, TriggerMetrics]] = []
-        for candidate_record in unique_records.values():
+        for candidate_record in candidate_records:
             heldout_metrics = self.evaluate(candidate_record.trigger_ids, self.heldout_texts)
             evaluated.append((candidate_record, heldout_metrics))
             self.heldout_evaluations.append(
@@ -814,6 +1070,14 @@ def save_results(
             "heldout_mean_target_probability": best.heldout_target_probability,
             "heldout_target_hit_rate": best.heldout_target_hit_rate,
             "heldout_mean_target_margin": best.heldout_target_margin,
+            "robust_worst_target_probability": best.robust_worst_target_probability,
+            "robust_worst_target_hit_rate": best.robust_worst_target_hit_rate,
+            "robust_low_quantile_margin": best.robust_low_quantile_margin,
+            "heldout_robust_worst_target_probability": (
+                best.heldout_robust_worst_target_probability
+            ),
+            "heldout_robust_worst_target_hit_rate": best.heldout_robust_worst_target_hit_rate,
+            "heldout_robust_low_quantile_margin": best.heldout_robust_low_quantile_margin,
         },
         "config": asdict(config),
     }
@@ -838,6 +1102,21 @@ def _device(value: str) -> torch.device:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="I-GCG-style MoE routing trigger optimization.")
     parser.add_argument("--checkpoint_path", required=True)
+    parser.add_argument(
+        "--robust_checkpoint_paths",
+        nargs="+",
+        default=[],
+        help=(
+            "Additional benign checkpoints used only for robust candidate screening. "
+            "The primary --checkpoint_path remains the gradient/search model."
+        ),
+    )
+    parser.add_argument(
+        "--robust_margin_quantile",
+        type=float,
+        default=0.1,
+        help="Checkpoint-level margin quantile used after worst-checkpoint hit rate.",
+    )
     parser.add_argument("--model_name_or_path", default="model_ckpt/switch-base-8")
     parser.add_argument("--target_layer", required=True)
     target = parser.add_mutually_exclusive_group(required=True)
@@ -872,6 +1151,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> IGCGTriggerConfig:
     args = _parser().parse_args(argv)
     values = vars(args)
     profile = values.pop("lfe_profile")
+    values["robust_checkpoint_paths"] = tuple(values["robust_checkpoint_paths"])
     if values["target_expert"] is None:
         values["target_expert"] = select_low_frequency_target(profile, values["target_layer"])
     config = IGCGTriggerConfig(**values)
@@ -892,6 +1172,8 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> IGCGTriggerConfig:
         raise ValueError("combine_top_p cannot exceed candidate_batch_size.")
     if config.margin_weight < 0:
         raise ValueError("margin_weight must be >= 0.")
+    if not 0 <= config.robust_margin_quantile <= 1:
+        raise ValueError("robust_margin_quantile must be in [0, 1].")
     if config.heldout_samples >= config.calibration_samples:
         raise ValueError("heldout_samples must be smaller than calibration_samples.")
     for value in (config.target_probability_threshold, config.target_hit_rate_threshold):
@@ -923,6 +1205,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     optimizer = IGCGTriggerOptimizer(
         model, tokenizer, config, optimization_texts, heldout_texts, device
     )
+    if optimizer.robust_screening_enabled:
+        print(
+            "Robust checkpoint screening enabled: "
+            f"checkpoints={len(optimizer.checkpoint_paths)}, "
+            f"margin_quantile={config.robust_margin_quantile:g}",
+            flush=True,
+        )
+        for checkpoint_path in optimizer.checkpoint_paths:
+            print(f"  - {checkpoint_path}", flush=True)
     best = optimizer.optimize()
     output = Path(config.output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
     save_results(output, config, best, optimizer.records, optimizer.heldout_evaluations)
