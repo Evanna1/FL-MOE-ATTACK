@@ -59,13 +59,11 @@ class MixFedMoEConfig:
     attack_start_round: int = 1
     attack_end_round: int = 0
     inject_target_expert: bool = False
-    inject_benign_train_asr_threshold: float = 0.95
     attack_mode: str = "badnet"
     neurotoxin_mask_ratio: float = 0.95
-    malicious_train_force_route: bool = False
-    malicious_train_router: bool = False
-    malicious_train_embedding: bool = False
-    malicious_embedding_delta_scale: float = 0.0
+    neurotoxin_aggregate_all_layers: bool = True
+    neurotoxin_max_update_norm: float = 0.0
+    neurotoxin_update_scale: float = 1.0
     malicious_lr: float = 0.0
     malicious_local_epochs: float = 0.0
     trigger: str = "cf"
@@ -190,7 +188,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--neurotoxin_mask_ratio",
         type=float,
         default=0.95,
-        help="Neurotoxin: fraction of smallest-benign-gradient coordinates to keep (mask the top rest).",
+        help="Neurotoxin: fraction of smallest global-update coordinates to keep (mask the top rest).",
+    )
+    parser.add_argument(
+        "--neurotoxin_aggregate_all_layers",
+        action="store_true",
+        default=True,
+        help="Build one exact global bottom-k mask across all trainable tensors (BackFed default).",
+    )
+    parser.add_argument(
+        "--neurotoxin_mask_per_layer",
+        action="store_false",
+        dest="neurotoxin_aggregate_all_layers",
+        help="Build an independent exact bottom-k mask for each trainable tensor.",
+    )
+    parser.add_argument(
+        "--neurotoxin_max_update_norm",
+        type=float,
+        default=0.0,
+        help="Optional L2 radius for projected malicious local training; 0 disables projection.",
+    )
+    parser.add_argument(
+        "--neurotoxin_update_scale",
+        type=float,
+        default=1.0,
+        help="Scale the final masked malicious model delta before upload; 1 leaves it unchanged.",
     )
     parser.add_argument(
         "--malicious_lr",
@@ -204,40 +226,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Local epochs the malicious client runs during attack rounds (0 => same as honest).",
-    )
-    parser.add_argument(
-        "--malicious_train_router",
-        action="store_true",
-        default=False,
-        help="Malicious client jointly trains the target-layer ROUTER together with the target expert "
-        "using classification loss plus target-expert cross entropy on exact trigger token matches. "
-        "Requires --inject_target_expert. Inference keeps natural routing; success is not guaranteed.",
-    )
-    parser.add_argument(
-        "--malicious_train_embedding",
-        action="store_true",
-        default=False,
-        help="During localized injection, jointly train the model input embedding layer and the "
-        "target expert while keeping the router, head, backbone, and all other experts frozen. "
-        "This fixed scope remains active throughout the configured attack window.",
-    )
-    parser.add_argument(
-        "--malicious_embedding_delta_scale",
-        type=float,
-        default=0.0,
-        help="Scale gamma applied to the malicious client's input-embedding DELTA before upload: "
-        "upload e_g + gamma * (e_trained - e_g), so FedAvg dilution (1/N) is cancelled and the "
-        "aggregated embedding lands on e_trained. Set gamma = num_clients for equal-weight FedAvg. "
-        "Only the trigger-token rows listed in --selected_triggers_path are amplified (requires it, "
-        "and implies embedding training). 0 => off (upload the trained embedding as-is).",
-    )
-    parser.add_argument(
-        "--malicious_train_force_route",
-        action="store_true",
-        default=False,
-        help="Malicious client forces the target-layer router to the target expert DURING its local "
-        "poison training, so the poison signal actually reaches the (cold) expert and a strong payload "
-        "is written. Requires --inject_target_expert. Inference/eval routing is unchanged (natural).",
     )
     parser.add_argument("--target_label", type=int, default=0)
     parser.add_argument("--attack_start_round", type=int, default=1)
@@ -254,17 +242,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Malicious-client deviation: force the target (low-frequency) expert into this client's "
         "trainable/uploaded set so it becomes the sole aggregation contributor for that expert.",
-    )
-    parser.add_argument(
-        "--inject_benign_train_asr_threshold",
-        "--inject_full_train_asr_threshold",
-        dest="inject_benign_train_asr_threshold",
-        type=float,
-        default=0.95,
-        help="With --inject_target_expert, switch malicious clients from target-expert-only "
-        "training back to the configured benign-client mode starting in the round after "
-        "centralized ASR first reaches this threshold (default: 0.95). The old "
-        "--inject_full_train_asr_threshold spelling remains an alias.",
     )
     parser.add_argument(
         "--lfe_target_layer",
@@ -403,6 +380,10 @@ def validate_config(config: MixFedMoEConfig) -> None:
         raise ValueError("--attack_mode must be 'badnet' or 'neurotoxin'.")
     if not 0.0 < config.neurotoxin_mask_ratio < 1.0:
         raise ValueError("--neurotoxin_mask_ratio must be in (0, 1).")
+    if config.neurotoxin_max_update_norm < 0.0:
+        raise ValueError("--neurotoxin_max_update_norm must be >= 0.")
+    if config.neurotoxin_update_scale <= 0.0:
+        raise ValueError("--neurotoxin_update_scale must be > 0.")
     if config.attack_end_round > 0 and config.attack_end_round < config.attack_start_round:
         raise ValueError("--attack_end_round must be >= --attack_start_round when set.")
     if config.inject_target_expert:
@@ -413,17 +394,6 @@ def validate_config(config: MixFedMoEConfig) -> None:
                 "--inject_target_expert requires a target expert: set --lfe_target_layer and "
                 "--lfe_target_expert (or provide --selected_triggers_path)."
             )
-    if config.malicious_train_embedding and not config.inject_target_expert:
-        raise ValueError("--malicious_train_embedding requires --inject_target_expert.")
-    if config.malicious_embedding_delta_scale < 0:
-        raise ValueError("--malicious_embedding_delta_scale must be >= 0.")
-    if config.malicious_embedding_delta_scale > 0 and not config.trigger_token_ids:
-        raise ValueError(
-            "--malicious_embedding_delta_scale requires --selected_triggers_path pointing to a "
-            "selected_triggers.json with best_trigger.trigger_token_ids."
-        )
-    if not 0.0 < config.inject_benign_train_asr_threshold <= 1.0:
-        raise ValueError("--inject_benign_train_asr_threshold must be in (0, 1].")
     if not config.trigger.strip():
         raise ValueError("--trigger must not be empty.")
     if config.trigger_token_ids and len(config.trigger_token_ids) + 1 >= config.max_length:
@@ -521,14 +491,11 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
         attack_start_round=args.attack_start_round,
         attack_end_round=args.attack_end_round,
         inject_target_expert=args.inject_target_expert,
-        inject_benign_train_asr_threshold=args.inject_benign_train_asr_threshold,
         attack_mode=args.attack_mode,
         neurotoxin_mask_ratio=args.neurotoxin_mask_ratio,
-        malicious_train_force_route=args.malicious_train_force_route,
-        malicious_train_router=args.malicious_train_router,
-        # Delta amplification needs a trainable input embedding, so it implies embedding training.
-        malicious_train_embedding=args.malicious_train_embedding or args.malicious_embedding_delta_scale > 0,
-        malicious_embedding_delta_scale=args.malicious_embedding_delta_scale,
+        neurotoxin_aggregate_all_layers=args.neurotoxin_aggregate_all_layers,
+        neurotoxin_max_update_norm=args.neurotoxin_max_update_norm,
+        neurotoxin_update_scale=args.neurotoxin_update_scale,
         malicious_lr=args.malicious_lr,
         malicious_local_epochs=args.malicious_local_epochs,
         trigger=trigger,

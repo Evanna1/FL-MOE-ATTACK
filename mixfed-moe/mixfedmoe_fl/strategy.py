@@ -27,7 +27,7 @@ from flwr.server.strategy import FedAvg
 
 from mixfedmoe_fl import defenses
 from mixfedmoe_fl.config import MixFedMoEConfig
-from mixfedmoe_fl.logging_utils import append_benign_lfe_activation_rows
+from mixfedmoe_fl.logging_utils import append_benign_lfe_activation_rows, append_expert_assignment_log
 
 LAYER_ID_PATTERN = re.compile(r"^(encoder|decoder)\.(\d+)$")
 EXPERT_PARAM_PATTERN = re.compile(
@@ -163,11 +163,6 @@ class MixFedMoEStrategy(FedAvg):
         self._last_activation_profiles: Dict[str, Dict[str, List[int]]] = {}
         self.cumulative_round_time: float = 0.0
         self._latest_fit_metrics: Dict[str, Scalar] = {}
-        # Centralized ASR is only known on the server after a round has been
-        # aggregated. Keep the transition here (rather than in a simulation
-        # client, which may be recreated) and broadcast it on subsequent fits.
-        self._inject_benign_training_active: bool = False
-        self._inject_benign_training_trigger_round: Optional[int] = None
 
         self.defense = str(getattr(self.runtime_config, "defense", "none"))
         self.defense_clip_norm = float(getattr(self.runtime_config, "defense_clip_norm", 5.0))
@@ -519,6 +514,12 @@ class MixFedMoEStrategy(FedAvg):
             enforce_global_coverage=self._requires_global_coverage(),
         )
         self._last_round_assignments = per_client_assignments
+        append_expert_assignment_log(
+            self.runtime_config.output_dir,
+            server_round,
+            per_client_assignments,
+            {layer_id: self.layer_num_experts[layer_id] for layer_id in self.layer_ids},
+        )
 
         incoming_names_json = json.dumps(self.parameter_names)
         fit_instructions: List[Tuple[ClientProxy, FitIns]] = []
@@ -535,7 +536,6 @@ class MixFedMoEStrategy(FedAvg):
                 "eval_batch_size": int(self.runtime_config.eval_batch_size),
                 "incoming_parameter_names_json": incoming_names_json,
                 "assigned_experts_json": json.dumps(per_client_assignments[client.cid], sort_keys=True),
-                "inject_benign_training_active": bool(self._inject_benign_training_active),
             }
             fit_instructions.append((client, FitIns(parameters=parameters, config=config)))
         return fit_instructions
@@ -731,25 +731,6 @@ class MixFedMoEStrategy(FedAvg):
             mode = _as_str(metrics.get("mode", self.runtime_config.mode)).lower()
             if mode not in {"full", "mix", "drop", "flex"}:
                 raise ValueError(f"Client {client_cid} reported invalid mode='{mode}'.")
-            reported_benign_training = bool(metrics.get("inject_benign_training_active", False))
-            reported_client_id = int(metrics.get("client_id", client_cid))
-            attack_end = int(self.runtime_config.attack_end_round)
-            attack_window_active = server_round >= int(self.runtime_config.attack_start_round) and (
-                attack_end <= 0 or server_round <= attack_end
-            )
-            inject_benign_training_active = bool(
-                self._inject_benign_training_active
-                and self.runtime_config.attack_enabled
-                and self.runtime_config.inject_target_expert
-                and reported_client_id in self.runtime_config.malicious_clients
-                and attack_window_active
-            )
-            if reported_benign_training != inject_benign_training_active:
-                raise ValueError(
-                    f"Client {client_cid} reported inject_benign_training_active="
-                    f"{reported_benign_training}, expected {inject_benign_training_active}."
-                )
-
             assignments = self._parse_assignments_metric(metrics=metrics, client_cid=client_cid)
             round_assignments[client_cid] = assignments
 
@@ -1051,28 +1032,6 @@ class MixFedMoEStrategy(FedAvg):
             return None
         loss, metrics = eval_res
         merged_metrics: Dict[str, Scalar] = dict(metrics)
-        if (
-            not self._inject_benign_training_active
-            and self.runtime_config.attack_enabled
-            and self.runtime_config.inject_target_expert
-            and "asr" in metrics
-            and _as_float(metrics["asr"])
-            >= float(self.runtime_config.inject_benign_train_asr_threshold)
-        ):
-            self._inject_benign_training_active = True
-            self._inject_benign_training_trigger_round = int(server_round)
-            print(
-                f"[MixFedMoE][round={server_round}] ASR={_as_float(metrics['asr']):.6f} reached "
-                f"{self.runtime_config.inject_benign_train_asr_threshold:.6f}; malicious clients "
-                "will resume benign-style mode trainability with poisoned data from the next "
-                "attack round onward.",
-                flush=True,
-            )
-        merged_metrics["inject_benign_training_active"] = bool(self._inject_benign_training_active)
-        if self._inject_benign_training_trigger_round is not None:
-            merged_metrics["inject_benign_training_trigger_round"] = int(
-                self._inject_benign_training_trigger_round
-            )
         for key, value in eval_config.items():
             if key not in merged_metrics:
                 merged_metrics[key] = value

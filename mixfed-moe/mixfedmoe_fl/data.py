@@ -12,9 +12,11 @@ from mixfedmoe_fl.config import MixFedMoEConfig, SUPPORTED_DATASET_NAME_TO_HF, s
 try:
     from flwr_datasets import FederatedDataset
     from flwr_datasets.partitioner import IidPartitioner
+    # from flwr_datasets.partitioner import DirichletPartitioner
 except ImportError:
     FederatedDataset = None  # type: ignore[assignment]
     IidPartitioner = None  # type: ignore[assignment]
+    # DirichletPartitioner = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -221,6 +223,16 @@ class MixFedMoEDataManager:
 
         hf_dataset_name = resolve_hf_dataset_name(self.config.dataset_name)
         partitioner = IidPartitioner(num_partitions=self.config.num_clients)
+        # Non-IID: label-skewed Dirichlet partition; smaller --alpha means stronger skew.
+        # partitioner = DirichletPartitioner(
+        #     num_partitions=self.config.num_clients,
+        #     partition_by="label",
+        #     alpha=self.config.alpha,
+        #     min_partition_size=10,
+        #     self_balancing=False,
+        #     shuffle=True,
+        #     seed=self.config.seed,
+        # )
         self._fds = FederatedDataset(
             dataset=hf_dataset_name,
             partitioners={"train": partitioner},

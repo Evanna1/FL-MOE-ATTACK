@@ -29,13 +29,6 @@ ROUND_CSV_COLUMNS = [
     "benign_lfe_activation_count",
     "benign_lfe_valid_tokens",
     "num_benign_clients_profiled",
-    "malicious_router_trigger_tokens",
-    "malicious_router_margin",
-    "malicious_router_target_probability",
-    "malicious_router_target_hit_rate",
-    "malicious_router_margin_loss",
-    "malicious_router_clean_kl",
-    "malicious_router_update_norm",
     "mode",
     "attack_enabled",
     "monitor_asr",
@@ -115,6 +108,35 @@ def append_benign_lfe_activation_rows(output_dir: str, rows: list[Dict[str, Any]
             writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in BENIGN_LFE_ACTIVATION_COLUMNS})
+    return path
+
+
+def append_expert_assignment_log(
+    output_dir: str,
+    server_round: int,
+    round_assignments: Dict[str, Dict[str, list[int]]],
+    layer_num_experts: Dict[str, int],
+) -> str:
+    """Append one round of per-layer expert assignments to expert_assignments.jsonl.
+
+    Per layer: `per_client` maps client id -> assigned experts, and `coverage` is a
+    list indexed by expert id giving how many sampled clients were assigned it
+    (e.g. encoder.11: [4, 4, 4, 4, 4, 4, 4, 4]).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "expert_assignments.jsonl")
+    layers: Dict[str, Any] = {}
+    for layer_id, num_experts in layer_num_experts.items():
+        coverage = [0] * num_experts
+        per_client: Dict[str, list[int]] = {}
+        for cid, client_assignment in round_assignments.items():
+            experts = [int(x) for x in client_assignment.get(layer_id, [])]
+            per_client[cid] = experts
+            for expert_idx in experts:
+                coverage[expert_idx] += 1
+        layers[layer_id] = {"coverage": coverage, "per_client": per_client}
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"round": int(server_round), "layers": layers}, sort_keys=True) + "\n")
     return path
 
 

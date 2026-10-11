@@ -149,11 +149,15 @@ ASR 测试会排除真实标签已等于目标标签的样本，给其余测试�
 
 ### 6.2 Neurotoxin
 
-`--attack_mode neurotoxin` 会先在良性本地数据上估计可训练参数的梯度幅度，然后只保留梯度最小的一定比例坐标用于投毒更新。保留比例由 `--neurotoxin_mask_ratio` 控制，用于研究在良性更新较少触及的参数子空间中保存后门的能力。
+`--attack_mode neurotoxin` 使用相邻两轮全局模型之差作为服务器聚合更新的观测，然后只保留更新幅度最小的一定比例坐标用于投毒训练。保留比例由 `--neurotoxin_mask_ratio` 控制，用于在正常联邦训练较少修改的参数子空间中保存后门。
+
+该实现遵循原论文的下载更新思想，但服务器不感知也不协助攻击：服务器向所有客户端正常下发当前全局模型；恶意客户端通过 Flower `Context.state` 独立保存自己上次收到的全局模型，并以两次观测之差构造精确 bottom-k 掩码。`--neurotoxin_mask_per_layer` 可改为逐参数张量独立构造掩码。掩码外坐标会在每次优化后恢复，避免 AdamW weight decay 造成漂移。还可通过 `--neurotoxin_max_update_norm` 对本地更新执行 L2 投影，并通过 `--neurotoxin_update_scale` 在上传前缩放最终的掩码更新。
+
+恶意客户端第一次参与时没有历史全局模型，该次退化为不加 Neurotoxin 掩码的投毒训练；之后使用当前模型与自己上次观测模型之差。客户端即使尚未进入攻击窗口，也会在被采样时更新本地快照。若 `fraction_fit < 1` 导致该客户端中间缺席若干轮，差值表示两次实际参与之间的累计全局变化，而不是严格相邻轮变化。Non-IID 情况下，该信号来自全局聚合模型，不依赖恶意客户端自己的局部梯度。
 
 ### 6.3 低频专家定向注入
 
-`--inject_target_expert` 允许恶意客户端偏离服务器分配，将目标专家强制放入目标层的 K 个上传槽位。初始阶段只训练目标专家，其他参数均冻结；服务器集中评估的 ASR 首次达到 `--inject_benign_train_asr_threshold`（默认 `0.95`）后，从下一个攻击轮次起恢复与良性客户端相同的模式训练规则，但仍使用投毒数据，并继续保证目标专家在分配列表中。
+`--inject_target_expert` 允许恶意客户端偏离服务器分配，将目标专家强制放入目标层的 K 个上传槽位。攻击有效轮次会自动对精确 trigger token 位置的目标 Router 行施加交叉熵损失，无需额外的 Router 训练开关；`drop` 模式会自动把全局专家编号映射为裁剪后的本地 Router 行。
 
 目标可通过以下方式设置：
 
@@ -166,20 +170,6 @@ ASR 测试会排除真实标签已等于目标标签的样本，给其余测试�
 ### 6.4 攻击持久性
 
 通过设置有限攻击窗口，可以在攻击者停止投毒后继续训练并逐轮观察 ASR。`shells/run_persistence_attack.sh` 已提供冷专家、热专家、标准 BadNet 和攻击者持续在线四组对照。
-
-### 6.5 当前预留但未接入的攻击参数
-
-`--malicious_train_router` 会在定向专家注入期间联合训练目标层 router 的目标专家行。训练使用
-trigger-token logit margin loss，并在非 trigger token 上使用相对本轮入参 router 的 KL 保持损失；
-非目标行每步恢复，目标行更新被限制在配置的 L2 半径内。相关参数为：
-
-- `--malicious_router_loss_weight`
-- `--malicious_router_margin`
-- `--malicious_router_clean_kl_weight`
-- `--malicious_router_lr_scale`
-- `--malicious_router_max_update_norm`
-
-`--malicious_train_force_route` 目前仍只被配置解析器接受，客户端训练尚未读取它。
 
 ## 7. 低频专家分析
 
@@ -352,13 +342,16 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | `--target_label` | `0` | 攻击目标标签 |
 | `--trigger` | `cf` | 文本触发器 |
 | `--attack_mode` | `badnet` | `badnet/neurotoxin` |
-| `--neurotoxin_mask_ratio` | `0.95` | 保留的小梯度坐标比例 |
+| `--neurotoxin_mask_ratio` | `0.95` | 保留的低全局更新幅度坐标比例 |
+| `--neurotoxin_aggregate_all_layers` | 开启 | 在全部可训练参数的全局模型差上构造一个精确 bottom-k 掩码 |
+| `--neurotoxin_mask_per_layer` | 关闭 | 改为对每个参数张量的全局模型差独立构造 bottom-k 掩码 |
+| `--neurotoxin_max_update_norm` | `0` | 本地恶意更新的 L2 投影半径；0 表示关闭 |
+| `--neurotoxin_update_scale` | `1` | 上传前对最终恶意模型增量的缩放倍数 |
 | `--attack_start_round` | `1` | 攻击起始轮 |
 | `--attack_end_round` | `0` | 攻击结束轮；0 表示不结束 |
 | `--malicious_lr` | `0` | 恶意学习率；0 表示沿用普通值 |
 | `--malicious_local_epochs` | `0` | 恶意本地 epoch；0 表示沿用普通值 |
-| `--inject_target_expert` | 关闭 | 强制目标专家进入恶意客户端分配；达到 ASR 阈值前只训练目标专家 |
-| `--inject_benign_train_asr_threshold` | `0.95` | 定向注入达到该 ASR 后，下一轮起恶意客户端恢复当前模式的良性训练范围（旧参数名仍可作别名） |
+| `--inject_target_expert` | 关闭 | 强制目标专家进入恶意客户端分配，只训练目标专家 |
 | `--lfe_target_layer` | 空 | 目标 MoE 层，如 `encoder.5` |
 | `--lfe_target_expert` | 空 | 目标专家编号 |
 | `--selected_triggers_path` | 空 | I-GCG 的 `selected_triggers.json` |
@@ -372,9 +365,6 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | `--init_checkpoint` | `--checkpoint_path` 的别名 |
 | `--lfe_profile_trainings` | 兼容参数；训练 hook 画像按每个参与轮次执行 |
 | `--lfe_calibration_samples` | 兼容参数；训练 hook 使用实际训练批次 |
-| `--malicious_train_router` | 定向注入时联合训练目标 router 行（margin + clean KL + L2 投影） |
-| `--malicious_train_force_route` | 已解析但尚未接入训练逻辑 |
-
 完整、实时的参数帮助可通过下列命令查看：
 
 ```bash

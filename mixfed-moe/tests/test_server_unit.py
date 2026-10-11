@@ -72,3 +72,51 @@ def test_natural_trigger_routing_tracker_measures_probability_top1_and_capacity(
     assert metrics["trigger_target_hit_rate"] == 1.0
     assert metrics["trigger_target_execution_rate"] == 0.5
     assert metrics["trigger_routing_tokens"] == 2
+
+
+def test_natural_trigger_routing_tracker_shifts_mask_for_decoder_router() -> None:
+    class IdentityClassifier(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class FakeRouter(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.classifier = IdentityClassifier()
+
+        def forward(self, hidden_states):
+            logits = self.classifier(hidden_states)
+            probabilities = torch.softmax(logits, dim=-1)
+            selected = torch.nn.functional.one_hot(logits.argmax(dim=-1), num_classes=3)
+            return probabilities.max(dim=-1).values.unsqueeze(-1), selected, logits
+
+    router = FakeRouter()
+    tracker = _NaturalTriggerRoutingTracker(
+        router,
+        target_expert=1,
+        trigger_token_ids=(7, 8),
+        decoder=True,
+    )
+    # Encoder positions 2 and 3 contain the trigger. After shift_right(), the
+    # decoder consumes those two trigger tokens at positions 3 and 4.
+    input_ids = torch.tensor([[10, 11, 7, 8, 1]])
+    attention_mask = torch.ones_like(input_ids)
+    decoder_router_logits = torch.tensor(
+        [
+            [2.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ]
+    )
+    try:
+        tracker.begin_batch(input_ids, attention_mask)
+        router(decoder_router_logits)
+        metrics = tracker.metrics()
+    finally:
+        tracker.remove()
+
+    assert metrics["trigger_target_hit_rate"] == 1.0
+    assert metrics["trigger_target_execution_rate"] == 1.0
+    assert metrics["trigger_routing_tokens"] == 2

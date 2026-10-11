@@ -34,11 +34,18 @@ class _NaturalTriggerRoutingTracker:
     to and processed by the expert.
     """
 
-    def __init__(self, router: torch.nn.Module, target_expert: int, trigger_token_ids: Sequence[int]) -> None:
+    def __init__(
+        self,
+        router: torch.nn.Module,
+        target_expert: int,
+        trigger_token_ids: Sequence[int],
+        decoder: bool = False,
+    ) -> None:
         self.target_expert = int(target_expert)
         self.trigger_token_ids = tuple(int(token_id) for token_id in trigger_token_ids)
         if not self.trigger_token_ids:
             raise ValueError("Natural trigger routing requires non-empty trigger_token_ids.")
+        self.decoder = bool(decoder)
         self._trigger_mask: Optional[torch.Tensor] = None
         self.target_probability_sum = 0.0
         self.top1_hits = 0
@@ -64,6 +71,12 @@ class _NaturalTriggerRoutingTracker:
                     "Triggered test input does not contain the configured trigger_token_ids immediately before EOS."
                 )
             mask[row, trigger_positions] = True
+        if self.decoder:
+            # The sequence-classification model feeds shift_right(input_ids) to
+            # decoder routers, so token positions move one step to the right.
+            shifted = torch.zeros_like(mask)
+            shifted[:, 1:] = mask[:, :-1]
+            mask = shifted
         self._trigger_mask = mask.reshape(-1)
 
     def _selected_rows(self, values: torch.Tensor) -> torch.Tensor:
@@ -129,7 +142,7 @@ def _should_evaluate_asr(runtime_config: MixFedMoEConfig, server_round: int) -> 
     """Return whether this centralized evaluation should include triggered data."""
     return bool(
         runtime_config.attack_enabled
-        or (runtime_config.monitor_asr and server_round > 0)
+        or (runtime_config.monitor_asr and server_round >= 0)
     )
 
 
@@ -312,6 +325,7 @@ def make_central_evaluate_fn(
                         target_router,
                         int(runtime_config.lfe_target_expert),
                         runtime_config.trigger_token_ids,
+                        decoder=runtime_config.lfe_target_layer.startswith("decoder."),
                     )
                 elif runtime_config.lfe_target_layer is not None and runtime_config.lfe_target_expert is not None:
                     print(

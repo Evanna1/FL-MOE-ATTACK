@@ -7,7 +7,7 @@ from typing import List, Sequence
 import numpy as np
 from flwr.common import Code, FitRes, Status, ndarrays_to_parameters, parameters_to_ndarrays
 
-from mixfedmoe_fl.config import MixFedMoEConfig, parse_config
+from mixfedmoe_fl.config import MixFedMoEConfig
 from mixfedmoe_fl.strategy import MixFedMoEStrategy
 
 
@@ -54,60 +54,9 @@ def _config() -> MixFedMoEConfig:
         attack_enabled=True,
         malicious_clients=(0,),
         inject_target_expert=True,
-        inject_benign_train_asr_threshold=0.95,
         lfe_target_layer="encoder.0",
         lfe_target_expert=0,
     )
-
-
-def test_strategy_latches_benign_style_training_after_asr_reaches_threshold() -> None:
-    observed_asr = {1: 0.949, 2: 0.95, 3: 0.10}
-
-    def evaluate_fn(server_round, parameters, config):
-        _ = parameters, config
-        return 0.0, {"asr": observed_asr[server_round]}
-
-    parameters = ndarrays_to_parameters([np.zeros((1,), dtype=np.float32)])
-    strategy = MixFedMoEStrategy(
-        runtime_config=_config(),
-        parameter_names=["weight"],
-        initial_parameters=parameters,
-        evaluate_fn=evaluate_fn,
-    )
-    manager = _ClientManager([_Client("0")])
-
-    before = strategy.configure_fit(1, parameters, manager)[0][1].config
-    assert before["inject_benign_training_active"] is False
-
-    strategy.evaluate(1, parameters)
-    still_before = strategy.configure_fit(2, parameters, manager)[0][1].config
-    assert still_before["inject_benign_training_active"] is False
-
-    _, transition_metrics = strategy.evaluate(2, parameters)  # type: ignore[misc]
-    assert transition_metrics["inject_benign_training_active"] is True
-    assert transition_metrics["inject_benign_training_trigger_round"] == 2
-    after = strategy.configure_fit(3, parameters, manager)[0][1].config
-    assert after["inject_benign_training_active"] is True
-
-    # The transition is permanent even if a later ASR falls below the threshold.
-    strategy.evaluate(3, parameters)
-    assert strategy.configure_fit(3, parameters, manager)[0][1].config[
-        "inject_benign_training_active"
-    ] is True
-
-
-def test_benign_training_asr_threshold_defaults_to_point_95_and_keeps_old_alias() -> None:
-    default = parse_config(["--mode", "full"])
-    custom = parse_config(
-        ["--mode", "full", "--inject_benign_train_asr_threshold", "0.9"]
-    )
-    legacy_alias = parse_config(
-        ["--mode", "full", "--inject_full_train_asr_threshold", "0.8"]
-    )
-
-    assert default.inject_benign_train_asr_threshold == 0.95
-    assert custom.inject_benign_train_asr_threshold == 0.9
-    assert legacy_alias.inject_benign_train_asr_threshold == 0.8
 
 
 def test_adaptive_benign_style_training_keeps_sparse_assignment_boundary() -> None:
@@ -127,7 +76,6 @@ def test_adaptive_benign_style_training_keeps_sparse_assignment_boundary() -> No
         [np.zeros((1,), dtype=np.float32), np.zeros((1,), dtype=np.float32)]
     )
     strategy = MixFedMoEStrategy(cfg, names, initial_parameters=initial)
-    strategy._inject_benign_training_active = True
     client = _Client("0")
     manager = _ClientManager([client])
     fit_config = strategy.configure_fit(2, initial, manager)[0][1].config
@@ -145,7 +93,6 @@ def test_adaptive_benign_style_training_keeps_sparse_assignment_boundary() -> No
             "client_id": 0,
             "mode": "mix",
             "is_malicious": True,
-            "inject_benign_training_active": True,
             "assigned_experts_json": json.dumps(assignment),
             "returned_parameter_names_json": json.dumps(names),
         },

@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from flwr.client import Client, NumPyClient
-from flwr.common import NDArrays, Scalar
+from flwr.common import ArrayRecord, NDArrays, RecordDict, Scalar
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import DataCollatorWithPadding
@@ -29,6 +29,7 @@ from models.switch_transformers import SwitchTransformersForSequenceClassificati
 
 LAYER_KEY_PATTERN = re.compile(r"^(encoder|decoder)\.(\d+)$")
 _HF_LOGS_SILENCED = False
+_NEUROTOXIN_PREVIOUS_GLOBAL_KEY = "neurotoxin.previous_global"
 
 
 def _silence_hf_loading_logs_once() -> None:
@@ -317,54 +318,142 @@ class MoeHandle:
 
 
 class TriggerRouterLoss:
-    """Supervise natural router logits at exact trigger token occurrences."""
+    """Penalize a target MoE router when exact trigger-token spans are present."""
 
-    def __init__(self, classifier: nn.Module, token_ids: Sequence[int], target: int, decoder: bool):
-        self.token_ids = tuple(token_ids)
+    def __init__(
+        self,
+        classifier: nn.Module,
+        token_ids: Sequence[int],
+        target_expert: int,
+        decoder: bool,
+    ) -> None:
+        self.token_ids = tuple(int(token_id) for token_id in token_ids)
         if not self.token_ids:
-            raise ValueError("Router training requires non-empty trigger token IDs.")
-        self.target = target
-        self.decoder = decoder
+            raise ValueError("Trigger router loss requires non-empty trigger token IDs.")
+        if target_expert < 0:
+            raise ValueError("Trigger router target expert must be >= 0.")
+        self.target_expert = int(target_expert)
+        self.decoder = bool(decoder)
         self.mask: Optional[torch.Tensor] = None
         self.logits: Optional[torch.Tensor] = None
+        self.trigger_tokens = 0
         self.hook = classifier.register_forward_hook(self._capture)
 
-    def _capture(self, module, inputs, output):
+    def _capture(self, _module: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
+        if not isinstance(output, torch.Tensor):
+            raise RuntimeError("Target router classifier did not return a tensor.")
         self.logits = output
 
-    def begin_batch(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    def begin_batch(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
+        if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+            raise ValueError("Trigger router loss expects matching 2-D input_ids and attention_mask.")
+
         mask = torch.zeros_like(input_ids, dtype=torch.bool)
         width = len(self.token_ids)
         if input_ids.shape[1] >= width:
-            windows = input_ids.unfold(1, width, 1)
+            windows = input_ids.unfold(dimension=1, size=width, step=1)
             trigger = input_ids.new_tensor(self.token_ids)
-            matches = (windows == trigger).all(-1)
-            matches &= attention_mask.bool().unfold(1, width, 1).all(-1)
+            matches = windows.eq(trigger).all(dim=-1)
+            matches &= attention_mask.bool().unfold(1, width, 1).all(dim=-1)
             for offset in range(width):
-                mask[:, offset:offset + matches.shape[1]] |= matches
+                mask[:, offset : offset + matches.shape[1]] |= matches
+
+        # Switch decoder routers consume the right-shifted decoder sequence.
         if self.decoder:
             shifted = torch.zeros_like(mask)
             shifted[:, 1:] = mask[:, :-1]
             mask = shifted
+
         self.mask = mask
         self.logits = None
+        self.trigger_tokens = int(mask.sum().item())
 
     def loss(self) -> torch.Tensor:
         if self.logits is None or self.mask is None:
-            raise RuntimeError("Target router did not run during training forward.")
+            raise RuntimeError("Target router did not run after begin_batch().")
+        if self.logits.ndim < 2:
+            raise RuntimeError("Target router logits must have at least two dimensions.")
+        if self.target_expert >= self.logits.shape[-1]:
+            raise RuntimeError(
+                f"Target router expert index {self.target_expert} is outside "
+                f"[0, {self.logits.shape[-1] - 1}]."
+            )
+
         logits = self.logits.reshape(-1, self.logits.shape[-1])
         mask = self.mask.reshape(-1)
         if logits.shape[0] != mask.numel():
-            raise RuntimeError("Target router token shape does not match trigger mask.")
+            raise RuntimeError(
+                "Target router token shape does not match the trigger-token mask: "
+                f"logits={logits.shape[0]} mask={mask.numel()}."
+            )
         if not mask.any():
             return logits.sum() * 0.0
+
         selected = logits[mask].float()
-        targets = torch.full((selected.shape[0],), self.target, device=selected.device, dtype=torch.long)
+        targets = torch.full(
+            (selected.shape[0],),
+            self.target_expert,
+            device=selected.device,
+            dtype=torch.long,
+        )
         return nn.functional.cross_entropy(selected, targets)
 
-    def close(self):
+    def close(self) -> None:
         self.hook.remove()
+        self.mask = None
         self.logits = None
+
+
+def _build_trigger_router_loss(
+    moe_handles: Sequence[MoeHandle],
+    target_layer: str,
+    target_expert: int,
+    mode: str,
+    assignments: Dict[str, List[int]],
+    trigger_token_ids: Sequence[int],
+) -> TriggerRouterLoss:
+    target_handle = next(
+        (handle for handle in moe_handles if handle.layer_id == target_layer),
+        None,
+    )
+    if target_handle is None:
+        available = ", ".join(handle.layer_id for handle in moe_handles)
+        raise ValueError(
+            f"Target router layer '{target_layer}' was not found; available layers: {available}."
+        )
+    if not target_handle.gate_linear_path:
+        raise RuntimeError(f"Target MoE layer '{target_layer}' has no router classifier.")
+
+    local_target = int(target_expert)
+    if mode == "drop":
+        assigned = sorted(set(assignments[target_layer]))
+        if local_target not in assigned:
+            raise ValueError(
+                f"Target expert {local_target} is not retained in drop assignment "
+                f"for layer '{target_layer}': {assigned}."
+            )
+        local_target = assigned.index(local_target)
+
+    classifier = get_submodule_by_path(
+        target_handle.mlp_module,
+        target_handle.gate_linear_path,
+    )
+    if not isinstance(classifier, nn.Linear):
+        raise RuntimeError(
+            f"Router classifier at layer '{target_layer}' is not nn.Linear: "
+            f"{type(classifier).__name__}."
+        )
+    if local_target >= classifier.out_features:
+        raise ValueError(
+            f"Target router index {local_target} is outside [0, {classifier.out_features - 1}] "
+            f"for layer '{target_layer}'."
+        )
+    return TriggerRouterLoss(
+        classifier=classifier,
+        token_ids=trigger_token_ids,
+        target_expert=local_target,
+        decoder=target_handle.stack_name == "decoder",
+    )
 
 
 def collect_moe_handles(model: nn.Module) -> List[MoeHandle]:
@@ -560,8 +649,12 @@ def apply_mode_drop(model: nn.Module, moe_handles: Sequence[MoeHandle], layer_ho
         )
         with torch.no_grad():
             new_gate.weight.copy_(old_gate.weight[assigned, :].to(torch.float32))
+            if old_gate.weight.grad is not None:
+                new_gate.weight.grad = old_gate.weight.grad[assigned, :].to(torch.float32).clone()
             if old_gate.bias is not None:
                 new_gate.bias.copy_(old_gate.bias[assigned].to(torch.float32))
+                if old_gate.bias.grad is not None and new_gate.bias is not None:
+                    new_gate.bias.grad = old_gate.bias.grad[assigned].to(torch.float32).clone()
         new_gate.requires_grad_(True)
         set_submodule_by_path(handle.mlp_module, handle.gate_linear_path, new_gate)
 
@@ -613,6 +706,211 @@ def _state_dict_names(model: nn.Module) -> List[str]:
 def _trainable_parameter_names(model: nn.Module) -> List[str]:
     return [name for name, param in model.named_parameters() if param.requires_grad]
 
+#################### Neurotoxin attack begin##################
+# Return an exact-size boolean mask for the smallest-magnitude coordinates.
+def _exact_bottom_fraction_mask(values: torch.Tensor, ratio: float) -> torch.Tensor:
+    if values.numel() == 0:
+        raise ValueError("Cannot build a Neurotoxin mask from an empty tensor.")
+    if not 0.0 < ratio < 1.0:
+        raise ValueError("Neurotoxin mask ratio must be in (0, 1).")
+    flattened = values.detach().reshape(-1).to(device="cpu", dtype=torch.float32)
+    keep = max(1, min(flattened.numel(), int(flattened.numel() * ratio)))
+    # Neurotoxin commonly retains 95--99%, so selecting the small blocked top
+    # fraction is substantially cheaper than materializing indices for bottom 95--99%.
+    blocked = flattened.numel() - keep
+    mask = torch.ones(flattened.numel(), dtype=torch.bool)
+    if blocked > 0:
+        indices = torch.topk(flattened, k=blocked, largest=True, sorted=False).indices
+        mask[indices] = False
+    return mask.reshape(values.shape)
+
+# Build the paper-style exact bottom-k mask from the downloaded global update.
+def _build_neurotoxin_mask_from_global_update(
+    model: nn.Module,
+    ratio: float,
+    aggregate_all_layers: bool,
+) -> Dict[str, torch.Tensor]:
+    named = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    if not named:
+        raise RuntimeError("No trainable parameters are available for the Neurotoxin mask.")
+
+    if not aggregate_all_layers:
+        return {
+            name: _exact_bottom_fraction_mask(
+                param.grad.detach().abs() if param.grad is not None else torch.zeros_like(param),
+                ratio,
+            ).to(param.device)
+            for name, param in named
+        }
+
+    total = sum(param.numel() for _, param in named)
+    flat_magnitudes = torch.empty(total, dtype=torch.float32, device="cpu")
+    offset = 0
+    for _, param in named:
+        length = param.numel()
+        if param.grad is None:
+            flat_magnitudes[offset : offset + length].zero_()
+        else:
+            flat_magnitudes[offset : offset + length].copy_(
+                param.grad.detach().abs().reshape(-1).to(device="cpu", dtype=torch.float32)
+            )
+        offset += length
+
+    flat_mask = _exact_bottom_fraction_mask(flat_magnitudes, ratio).reshape(-1)
+    masks: Dict[str, torch.Tensor] = {}
+    offset = 0
+    for name, param in named:
+        length = param.numel()
+        masks[name] = flat_mask[offset : offset + length].reshape(param.shape).to(param.device)
+        offset += length
+    return masks
+
+
+@torch.no_grad()
+def _attach_global_update_to_parameter_grads(
+    model: nn.Module,
+    parameter_names: Sequence[str],
+    current_parameters: NDArrays,
+    previous_parameters: NDArrays,
+) -> float:
+    """Attach W_t - W_(t-1) to parameters as a temporary mask-building signal.
+
+    Storing the update in ``param.grad`` lets the signal follow retained expert
+    modules through mix/flex/drop structural transforms. It is cleared before
+    malicious optimization and is never used as an optimizer gradient.
+    """
+    if len(parameter_names) != len(current_parameters) or len(parameter_names) != len(
+        previous_parameters
+    ):
+        raise ValueError("Neurotoxin global-reference parameter counts do not match.")
+
+    current_by_name = dict(zip(parameter_names, current_parameters))
+    previous_by_name = dict(zip(parameter_names, previous_parameters))
+    squared_norm = 0.0
+    for name, parameter in model.named_parameters():
+        if name not in current_by_name or name not in previous_by_name:
+            raise KeyError(f"Missing Neurotoxin global update for model parameter '{name}'.")
+        current = torch.from_numpy(current_by_name[name])
+        previous = torch.from_numpy(previous_by_name[name])
+        if tuple(current.shape) != tuple(parameter.shape) or tuple(previous.shape) != tuple(
+            parameter.shape
+        ):
+            raise ValueError(
+                f"Neurotoxin reference shape mismatch for '{name}': "
+                f"model={tuple(parameter.shape)} current={tuple(current.shape)} "
+                f"previous={tuple(previous.shape)}."
+            )
+        update = (current.to(torch.float32) - previous.to(torch.float32)).to(parameter.device)
+        parameter.grad = update.to(parameter.dtype)
+        squared_norm += float(torch.sum(update.double() * update.double()).cpu().item())
+    return math.sqrt(squared_norm)
+
+
+def _load_neurotoxin_previous_global(client_state: RecordDict) -> Optional[NDArrays]:
+    """Load the last global model observed by this client."""
+    record = client_state.array_records.get(_NEUROTOXIN_PREVIOUS_GLOBAL_KEY)
+    if record is None:
+        return None
+    return record.to_numpy_ndarrays()
+
+
+def _save_neurotoxin_previous_global(
+    client_state: RecordDict,
+    parameters: NDArrays,
+) -> None:
+    """Persist an unmodified downloaded global model in Flower client state."""
+    client_state.array_records[_NEUROTOXIN_PREVIOUS_GLOBAL_KEY] = ArrayRecord(
+        numpy_ndarrays=[array.copy() for array in parameters]
+    )
+
+
+def _all_trainable_coordinates_mask(model: nn.Module) -> Dict[str, torch.Tensor]:
+    return {
+        name: torch.ones_like(parameter, dtype=torch.bool)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+# Apply the Neurotoxin gradient mask to the model's gradients.(false->0)
+@torch.no_grad()
+def _apply_neurotoxin_gradient_mask(
+    model: nn.Module, masks: Dict[str, torch.Tensor]
+) -> None:
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            if name not in masks:
+                raise KeyError(f"Missing Neurotoxin mask for trainable parameter '{name}'.")
+            param.grad.mul_(masks[name].to(dtype=param.grad.dtype))
+
+# Save only blocked coordinates so AdamW decay cannot move them.
+@torch.no_grad()
+def _snapshot_neurotoxin_blocked_values(
+    model: nn.Module, masks: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    return {
+        name: param.detach()[~masks[name]].clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad and name in masks
+    }
+
+# restrict the blocked coordinates to their original values
+@torch.no_grad()
+def _restore_neurotoxin_blocked_values(
+    model: nn.Module,
+    masks: Dict[str, torch.Tensor],
+    blocked_values: Dict[str, torch.Tensor],
+) -> None:
+    for name, param in model.named_parameters():
+        if param.requires_grad and name in masks:
+            param[~masks[name]] = blocked_values[name]
+
+
+def _snapshot_trainable_parameters(model: nn.Module) -> Dict[str, torch.Tensor]:
+    return {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+# 限制更新范数上限
+@torch.no_grad()
+def _project_neurotoxin_update(
+    model: nn.Module,
+    origin: Dict[str, torch.Tensor],
+    max_norm: float,
+) -> float:
+    """Project the complete trainable model delta onto an L2 ball around the global model."""
+    if max_norm <= 0.0:
+        return 0.0
+    squared_norm = torch.zeros((), dtype=torch.float64, device="cpu")
+    named = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    for name, param in named:
+        delta = param.detach() - origin[name]
+        squared_norm += delta.double().pow(2).sum().cpu()
+    update_norm = float(torch.sqrt(squared_norm).item())
+    if update_norm > max_norm:
+        scale = float(max_norm / max(update_norm, torch.finfo(torch.float64).eps))
+        for name, param in named:
+            param.copy_(origin[name] + (param - origin[name]) * scale)
+        return float(max_norm)
+    return update_norm
+
+# 按指定比例缩放更新
+@torch.no_grad()
+def _scale_neurotoxin_update(
+    model: nn.Module,
+    origin: Dict[str, torch.Tensor],
+    scale: float,
+) -> None:
+    if scale <= 0.0:
+        raise ValueError("Neurotoxin update scale must be > 0.")
+    if scale == 1.0:
+        return
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            param.copy_(origin[name] + (param - origin[name]) * scale)
+
+#################### Neurotoxin attack end##################
 
 def _infer_first_dim_size(obj: Any) -> int:
     if isinstance(obj, torch.Tensor):
@@ -764,11 +1062,15 @@ class MixFedMoEClient(NumPyClient):
         runtime_config: MixFedMoEConfig,
         data_manager: MixFedMoEDataManager,
         is_malicious: bool = False,
+        client_state: Optional[RecordDict] = None,
     ) -> None:
         self.client_id = client_id
         self.runtime_config = runtime_config
         self.data_manager = data_manager
         self.is_malicious = is_malicious
+        # Context.state is persisted per virtual client even when Flower creates
+        # a fresh MixFedMoEClient object for every message.
+        self.client_state = client_state if client_state is not None else RecordDict()
         self._dataset_bundle: Optional[ClientDatasetBundle] = None
         self._poisoned_dataset_bundle: Optional[ClientDatasetBundle] = None
 
@@ -817,49 +1119,6 @@ class MixFedMoEClient(NumPyClient):
             flush=True,
         )
         return assignments
-
-    def _compute_neurotoxin_mask(
-        self,
-        model: nn.Module,
-        clean_loader: DataLoader,
-        device: torch.device,
-        ratio: float,
-        max_batches: int = 10,
-    ) -> Dict[str, torch.Tensor]:
-        """Neurotoxin gradient mask (ported from the BackFed benchmark): keep the
-        `ratio` fraction of trainable coordinates with the SMALLEST benign-gradient
-        magnitude (where honest clients move least) and mask out the rest. Applied to
-        the poison gradient so the backdoor lives in the rarely-updated subspace --
-        the dense analogue of, and baseline for, cold-expert injection."""
-        named = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
-        model.zero_grad(set_to_none=True)
-        was_training = model.training
-        model.train()
-        batches = 0
-        for batch in clean_loader:
-            outputs = model(
-                input_ids=batch["input_ids"].to(device),
-                attention_mask=batch["attention_mask"].to(device),
-                labels=batch["labels"].to(device),
-                use_cache=False,
-                return_dict=True,
-            )
-            outputs.loss.backward()
-            batches += 1
-            if batches >= max_batches:
-                break
-        grads = {
-            name: (param.grad.detach().abs() if param.grad is not None else torch.zeros_like(param))
-            for name, param in named
-        }
-        flat = torch.cat([grad.flatten() for grad in grads.values()])
-        keep = max(1, int(flat.numel() * ratio))
-        threshold = torch.kthvalue(flat, keep).values
-        mask = {name: (grads[name] <= threshold).to(param.dtype) for name, param in named}
-        model.zero_grad(set_to_none=True)
-        if not was_training:
-            model.eval()
-        return mask
 
     def _build_model(self, bundle: ClientDatasetBundle) -> SwitchTransformersForSequenceClassification:
         _silence_hf_loading_logs_once()
@@ -995,10 +1254,42 @@ class MixFedMoEClient(NumPyClient):
             if attack_active and self.runtime_config.inject_target_expert:
                 assignments = self._force_target_expert_into_assignment(assignments)
 
+            current_parameters = parameters
+            neurotoxin_reference_parameters: Optional[NDArrays] = None
             incoming_param_names = self._resolve_incoming_param_names(
-                model=model, parameters=parameters, round_config=config
+                model=model, parameters=current_parameters, round_config=config
             )
-            _load_from_numpy_ndarrays(model=model, param_names=incoming_param_names, parameters=parameters)
+            attack_mode = str(self.runtime_config.attack_mode).lower()
+            tracks_neurotoxin_history = bool(
+                self.runtime_config.attack_enabled
+                and self.is_malicious
+                and attack_mode == "neurotoxin"
+            )
+            if tracks_neurotoxin_history:
+                neurotoxin_reference_parameters = _load_neurotoxin_previous_global(
+                    self.client_state
+                )
+                # Save the pristine downloaded model, never the locally trained
+                # model. This happens outside the attack window as well so the
+                # first active attack can use the latest model this client saw.
+                _save_neurotoxin_previous_global(self.client_state, current_parameters)
+            _load_from_numpy_ndarrays(
+                model=model,
+                param_names=incoming_param_names,
+                parameters=current_parameters,
+            )
+            neurotoxin_global_update_norm = 0.0
+            if (
+                attack_active
+                and attack_mode == "neurotoxin"
+                and neurotoxin_reference_parameters is not None
+            ):
+                neurotoxin_global_update_norm = _attach_global_update_to_parameter_grads(
+                    model=model,
+                    parameter_names=incoming_param_names,
+                    current_parameters=current_parameters,
+                    previous_parameters=neurotoxin_reference_parameters,
+                )
 
             eval_batch_size = _as_int(config, "eval_batch_size", self.runtime_config.eval_batch_size)
             collator = DataCollatorWithPadding(
@@ -1018,50 +1309,35 @@ class MixFedMoEClient(NumPyClient):
             else:
                 apply_mode_drop(model=model, moe_handles=base_moe_handles, layer_hot_map=assignments)
 
-            # if (
-            #     attack_active
-            #     and self.runtime_config.inject_target_expert
-            #     and self.runtime_config.lfe_target_layer is not None
-            #     and self.runtime_config.lfe_target_expert is not None
-            # ):
-            #     # Localized injection; optionally supervise the target-layer router.
-            #     stack_name, block_idx = self.runtime_config.lfe_target_layer.split(".")
-            #     layer_marker = f"{stack_name}.block.{block_idx}.layer"
-            #     expert_marker = f".experts.expert_{int(self.runtime_config.lfe_target_expert)}."
-            #     kept = 0
-            #     for name, param in model.named_parameters():
-            #         in_layer = name.startswith(f"{stack_name}.") and layer_marker in name
-            #         keep_expert = in_layer and expert_marker in name
-            #         param.requires_grad_(keep_expert)
-            #         kept += int(keep_expert)
-            #     if kept == 0:
-            #         raise RuntimeError(
-            #             f"Localized injection found no trainable params for expert "
-            #             f"{self.runtime_config.lfe_target_expert}@{self.runtime_config.lfe_target_layer}."
-            #         )
-            #     if self.runtime_config.malicious_train_router:
-            #         handle = next(h for h in collect_moe_handles(model)
-            #                       if h.layer_id == self.runtime_config.lfe_target_layer)
-            #         if not handle.gate_linear_path:
-            #             raise RuntimeError("Target router classifier was not found.")
-            #         gate = get_submodule_by_path(handle.mlp_module, handle.gate_linear_path)
-            #         gate.requires_grad_(True)
-            #         token_ids = self.runtime_config.trigger_token_ids
-            #         if not token_ids:
-            #             token_ids = self.data_manager.tokenizer.encode(
-            #                 self.runtime_config.trigger, add_special_tokens=False)
-            #         target = int(self.runtime_config.lfe_target_expert)
-            #         if mode == "drop":
-            #             target = assignments[handle.layer_id].index(target)
-            #         router_objective = TriggerRouterLoss(
-            #             gate, token_ids, target, handle.stack_name == "decoder")
-            #     print(
-            #         f"[MixFedMoE][client={self.client_id}] localized injection: training expert "
-            #         f"{self.runtime_config.lfe_target_expert}@{self.runtime_config.lfe_target_layer}"
-            #         f" with natural routing ({kept} expert tensors), "
-            #         f"train_router={router_objective is not None}",
-            #         flush=True,
-            #     )
+            if attack_active and self.runtime_config.inject_target_expert:
+                target_layer = self.runtime_config.lfe_target_layer
+                target_expert = self.runtime_config.lfe_target_expert
+                if target_layer is None or target_expert is None:
+                    raise RuntimeError(
+                        "Target router supervision requires lfe_target_layer and lfe_target_expert."
+                    )
+                trigger_token_ids = tuple(self.runtime_config.trigger_token_ids)
+                if not trigger_token_ids:
+                    encoded_trigger = self.data_manager.tokenizer(
+                        self.runtime_config.trigger,
+                        add_special_tokens=False,
+                        truncation=False,
+                    )
+                    trigger_token_ids = tuple(int(token_id) for token_id in encoded_trigger["input_ids"])
+                router_objective = _build_trigger_router_loss(
+                    moe_handles=base_moe_handles,
+                    target_layer=target_layer,
+                    target_expert=int(target_expert),
+                    mode=mode,
+                    assignments=assignments,
+                    trigger_token_ids=trigger_token_ids,
+                )
+                print(
+                    f"[MixFedMoE][client={self.client_id}] enabled automatic trigger-router loss "
+                    f"for expert {target_expert}@{target_layer} with "
+                    f"trigger_token_ids={list(trigger_token_ids)}",
+                    flush=True,
+                )
 
             local_epochs = _as_float(config, "local_epochs", self.runtime_config.local_epochs)
             learning_rate = _as_float(config, "learning_rate", self.runtime_config.learning_rate)
@@ -1097,27 +1373,47 @@ class MixFedMoEClient(NumPyClient):
             model.to(device)
             model.train()
 
+            ####### neurotoxin attack #######
             neurotoxin_mask: Optional[Dict[str, torch.Tensor]] = None
-            attack_mode = str(self.runtime_config.attack_mode).lower()
+            neurotoxin_origin: Optional[Dict[str, torch.Tensor]] = None
+            neurotoxin_mask_density = 0.0
+            neurotoxin_projected_norm = 0.0
+            neurotoxin_mask_source = "disabled"
+
             if attack_active and attack_mode == "neurotoxin":
-                clean_bundle = self._load_bundle(apply_badnet=False)
-                clean_loader = DataLoader(
-                    clean_bundle.train_dataset,
-                    batch_size=train_batch_size,
-                    shuffle=True,
-                    collate_fn=collator,
-                    num_workers=0,
-                    pin_memory=False,
+                if neurotoxin_reference_parameters is None:
+                    # This client has not observed an earlier global model yet.
+                    # Running unmasked is preferable to selecting arbitrary
+                    # coordinates from an all-zero pseudo-update.
+                    neurotoxin_mask = _all_trainable_coordinates_mask(model)
+                    neurotoxin_mask_source = "unavailable_first_participation"
+                else:
+                    neurotoxin_mask = _build_neurotoxin_mask_from_global_update(
+                        model=model,
+                        ratio=float(self.runtime_config.neurotoxin_mask_ratio),
+                        aggregate_all_layers=bool(
+                            self.runtime_config.neurotoxin_aggregate_all_layers
+                        ),
+                    )
+                    neurotoxin_mask_source = "previously_observed_global_update"
+                model.zero_grad(set_to_none=True)
+                kept_coordinates = sum(int(mask.sum().item()) for mask in neurotoxin_mask.values())
+                total_coordinates = sum(mask.numel() for mask in neurotoxin_mask.values())
+                neurotoxin_mask_density = float(
+                    kept_coordinates / max(total_coordinates, 1)
                 )
-                neurotoxin_mask = self._compute_neurotoxin_mask(
-                    model=model,
-                    clean_loader=clean_loader,
-                    device=device,
-                    ratio=float(self.runtime_config.neurotoxin_mask_ratio),
-                )
+                if (
+                    self.runtime_config.neurotoxin_max_update_norm > 0.0
+                    or self.runtime_config.neurotoxin_update_scale != 1.0
+                ):
+                    neurotoxin_origin = _snapshot_trainable_parameters(model)
                 print(
-                    f"[MixFedMoE][client={self.client_id}] neurotoxin attack: masking to bottom "
-                    f"{self.runtime_config.neurotoxin_mask_ratio:.2f} benign-gradient coordinates",
+                    f"[MixFedMoE][client={self.client_id}] neurotoxin attack: retained "
+                    f"{kept_coordinates}/{total_coordinates} "
+                    f"({neurotoxin_mask_density:.6f}) bottom global-update coordinates; "
+                    f"source={neurotoxin_mask_source} "
+                    f"global_update_norm={neurotoxin_global_update_norm:.6f}; "
+                    f"aggregate_all_layers={self.runtime_config.neurotoxin_aggregate_all_layers}",
                     flush=True,
                 )
 
@@ -1137,6 +1433,8 @@ class MixFedMoEClient(NumPyClient):
                 )
 
             total_loss = 0.0
+            total_router_loss = 0.0
+            total_router_tokens = 0
             total_examples = 0
             steps_done = 0
             round_start = time.time()
@@ -1164,15 +1462,35 @@ class MixFedMoEClient(NumPyClient):
                     if loss is None:
                         raise RuntimeError("Model forward returned loss=None during training.")
                     if router_objective is not None:
-                        loss = loss + router_objective.loss()
+                        router_loss = router_objective.loss()
+                        loss = loss + 0.1 * router_loss
+                        total_router_loss += float(router_loss.detach().item())
+                        total_router_tokens += router_objective.trigger_tokens
                     if loss.requires_grad:
                         loss.backward()
+                    blocked_values: Optional[Dict[str, torch.Tensor]] = None
                     if neurotoxin_mask is not None:
-                        for name, param in model.named_parameters():
-                            if param.requires_grad and param.grad is not None and name in neurotoxin_mask:
-                                param.grad.mul_(neurotoxin_mask[name])
+                        _apply_neurotoxin_gradient_mask(model, neurotoxin_mask)
+                        blocked_values = _snapshot_neurotoxin_blocked_values(
+                            model, neurotoxin_mask
+                        )
                     if loss.requires_grad:
                         optimizer.step()
+                    if neurotoxin_mask is not None and blocked_values is not None:
+                        _restore_neurotoxin_blocked_values(
+                            model, neurotoxin_mask, blocked_values
+                        )
+                    if (
+                        neurotoxin_origin is not None
+                        and self.runtime_config.neurotoxin_max_update_norm > 0.0
+                    ):
+                        neurotoxin_projected_norm = _project_neurotoxin_update(
+                            model=model,
+                            origin=neurotoxin_origin,
+                            max_norm=float(
+                                self.runtime_config.neurotoxin_max_update_norm
+                            ),
+                        )
 
                     total_loss += float(loss.item()) * batch_size
                     total_examples += batch_size
@@ -1247,6 +1565,13 @@ class MixFedMoEClient(NumPyClient):
             else:
                 activation_profile = local_profile
 
+            if neurotoxin_origin is not None:
+                _scale_neurotoxin_update(
+                    model=model,
+                    origin=neurotoxin_origin,
+                    scale=float(self.runtime_config.neurotoxin_update_scale),
+                )
+
             return_names: List[str]
             if "return_parameter_names_json" in config:
                 return_names = [str(x) for x in _parse_json_list(_as_str(config, "return_parameter_names_json", "[]"))]
@@ -1270,6 +1595,8 @@ class MixFedMoEClient(NumPyClient):
                 "assigned_experts_json": json.dumps(assignments, sort_keys=True),
                 "expert_activation_map_json": json.dumps(activation_profile, sort_keys=True),
                 "target_expert_activation_json": json.dumps(target_activation, sort_keys=True),
+                "trigger_router_loss": float(total_router_loss / max(steps_done, 1)),
+                "trigger_router_tokens": int(total_router_tokens),
                 "low_frequency_experts_json": json.dumps(
                     {
                         layer_id: layer["top_low_frequency_experts"]
@@ -1280,6 +1607,25 @@ class MixFedMoEClient(NumPyClient):
                 "lfe_workbook_path": lfe_workbook_path,
                 "returned_parameter_names_json": json.dumps(return_names),
             }
+            if neurotoxin_mask is not None:
+                metrics.update(
+                    {
+                        "neurotoxin_mask_density": float(neurotoxin_mask_density),
+                        "neurotoxin_mask_source": neurotoxin_mask_source,
+                        "neurotoxin_global_update_norm": float(
+                            neurotoxin_global_update_norm
+                        ),
+                        "neurotoxin_mask_coordinates": int(
+                            sum(mask.sum().item() for mask in neurotoxin_mask.values())
+                        ),
+                        "neurotoxin_projected_update_norm": float(
+                            neurotoxin_projected_norm
+                        ),
+                        "neurotoxin_update_scale": float(
+                            self.runtime_config.neurotoxin_update_scale
+                        ),
+                    }
+                )
             return outbound, total_examples, metrics
         finally:
             if router_objective is not None:
@@ -1298,6 +1644,8 @@ class MixFedMoEClient(NumPyClient):
 
 
 def make_client_fn(runtime_config: MixFedMoEConfig, data_manager: MixFedMoEDataManager):
+    client_states: Dict[int, RecordDict] = {}
+
     def client_fn(cid: str) -> Client:
         try:
             client_id = int(cid)
@@ -1308,6 +1656,7 @@ def make_client_fn(runtime_config: MixFedMoEConfig, data_manager: MixFedMoEDataM
             runtime_config=runtime_config,
             data_manager=data_manager,
             is_malicious=(client_id in runtime_config.malicious_clients),
+            client_state=client_states.setdefault(client_id, RecordDict()),
         ).to_client()
 
     return client_fn

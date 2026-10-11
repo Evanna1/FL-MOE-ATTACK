@@ -74,6 +74,7 @@ def _build_client_app(runtime_config: MixFedMoEConfig) -> ClientApp:
             runtime_config=runtime_config,
             data_manager=dm,
             is_malicious=(partition_id in runtime_config.malicious_clients),
+            client_state=context.state,
         )
         return client.to_client()
 
