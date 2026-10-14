@@ -238,17 +238,16 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | 值 | 行为 |
 |---|---|
 | `none` | 默认按样本数加权聚合 |
-| `norm_clip` | 按客户端完整更新向量的 L2 范数缩放 |
+| `norm_clip` | 共享参数与每个专家分别计算动态阈值；共享组使用 `Median + 3 × 1.4826 × MAD`，专家组使用 `Median + 2 × 1.4826 × MAD` |
 | `coord_median` | 每个参数逐坐标取贡献者中位数 |
 | `trimmed_mean` | 每个参数逐坐标去除两端一定比例后求均值 |
-| `multi_krum` | 用客户端完整更新向量距离选择若干客户端后聚合 |
+| `multi_krum` | 共享参数与每个 `(layer, expert)` 分组执行 Multi-Krum，只比较同组贡献者并分别筛选后聚合 |
 
 当前 robust aggregation 只支持 `mix` 模式。相关参数：
 
-- `--defense_clip_norm`：Norm Clip 阈值；
 - `--defense_trim_ratio`：截尾比例，范围 `[0, 0.5)`；
 - `--defense_num_malicious`：Krum 假定的恶意客户端数，`0` 时取恶意客户端列表长度；
-- `--defense_krum_m`：Multi-Krum 保留客户端数，`0` 时取“客户端总数减恶意数”。
+- `--defense_krum_m`：每个共享/专家组内 Multi-Krum 保留的贡献者数；`0` 时分别取“该组贡献者数减恶意数”。
 
 对于只有一个贡献者的冷专家，坐标中位数和截尾均值会退化为直接接受该贡献；这也是仓库独立防御实验重点验证的现象。
 

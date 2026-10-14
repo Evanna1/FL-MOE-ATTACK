@@ -18,6 +18,9 @@ SUPPORTED_DATASET_NAME_TO_HF: Dict[str, str] = {
 
 SUPPORTED_MODES: List[str] = ["full", "mix", "drop", "flex"]
 SUPPORTED_ASSIGNMENT_POLICIES: List[str] = ["hot", "random"]
+DEFAULT_BADNET_TRIGGER = "BadMagic"
+# Tokenized with model_ckpt/switch-base-8 and add_special_tokens=False.
+DEFAULT_BADNET_TRIGGER_TOKEN_IDS: Tuple[int, ...] = (3862, 22909, 447)
 
 
 def supported_dataset_names() -> List[str]:
@@ -56,7 +59,7 @@ class MixFedMoEConfig:
     malicious_clients: Tuple[int, ...] = (0,)
     poison_rate: float = 0.1
     target_label: int = 0
-    attack_start_round: int = 1
+    attack_start_round: int = 2
     attack_end_round: int = 0
     inject_target_expert: bool = False
     attack_mode: str = "badnet"
@@ -66,8 +69,8 @@ class MixFedMoEConfig:
     neurotoxin_update_scale: float = 1.0
     malicious_lr: float = 0.0
     malicious_local_epochs: float = 0.0
-    trigger: str = "cf"
-    trigger_token_ids: Tuple[int, ...] = ()
+    trigger: str = DEFAULT_BADNET_TRIGGER
+    trigger_token_ids: Tuple[int, ...] = DEFAULT_BADNET_TRIGGER_TOKEN_IDS
     selected_triggers_path: Optional[str] = None
     lfe_target_layer: Optional[str] = None
     lfe_target_expert: Optional[int] = None
@@ -77,7 +80,6 @@ class MixFedMoEConfig:
     lfe_top_k: int = 3
     lfe_calibration_samples: int = 512
     defense: str = "none"
-    defense_clip_norm: float = 5.0
     defense_trim_ratio: float = 0.2
     defense_krum_m: int = 0
     defense_num_malicious: int = 0
@@ -228,7 +230,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Local epochs the malicious client runs during attack rounds (0 => same as honest).",
     )
     parser.add_argument("--target_label", type=int, default=0)
-    parser.add_argument("--attack_start_round", type=int, default=1)
+    parser.add_argument("--attack_start_round", type=int, default=2)
     parser.add_argument(
         "--attack_end_round",
         type=int,
@@ -256,7 +258,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Target (cold) expert index for cold-expert injection; overrides --selected_triggers_path.",
     )
-    parser.add_argument("--trigger", type=str, default="cf")
+    parser.add_argument("--trigger", type=str, default=DEFAULT_BADNET_TRIGGER)
     parser.add_argument(
         "--selected_triggers_path",
         "--selected_triggers_file",
@@ -310,13 +312,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Server robust-aggregation defense applied in aggregate_fit (mix mode): "
         "norm_clip, coord_median, trimmed_mean, multi_krum.",
     )
-    parser.add_argument("--defense_clip_norm", type=float, default=5.0)
     parser.add_argument("--defense_trim_ratio", type=float, default=0.2)
     parser.add_argument(
         "--defense_krum_m",
         type=int,
         default=0,
-        help="Multi-Krum: number of clients to keep (0 => num_clients - num_malicious).",
+        help="Per-group Multi-Krum: contributors to keep in each shared/expert group "
+        "(0 => group contributors - num_malicious).",
     )
     parser.add_argument(
         "--defense_num_malicious",
@@ -431,8 +433,6 @@ def validate_config(config: MixFedMoEConfig) -> None:
             raise ValueError("--defense is currently supported only for --mode=mix.")
         if not 0.0 <= config.defense_trim_ratio < 0.5:
             raise ValueError("--defense_trim_ratio must be in [0, 0.5).")
-        if config.defense_clip_norm <= 0.0:
-            raise ValueError("--defense_clip_norm must be > 0.")
         if config.defense_krum_m < 0 or config.defense_num_malicious < 0:
             raise ValueError("--defense_krum_m and --defense_num_malicious must be >= 0.")
 
@@ -444,7 +444,9 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
     trigger = args.trigger
     lfe_target_layer: Optional[str] = None
     lfe_target_expert: Optional[int] = None
-    trigger_token_ids: Tuple[int, ...] = ()
+    trigger_token_ids = (
+        DEFAULT_BADNET_TRIGGER_TOKEN_IDS if trigger == DEFAULT_BADNET_TRIGGER else ()
+    )
     if args.selected_triggers_path is not None:
         selected = load_selected_trigger(args.selected_triggers_path)
         trigger = selected.trigger
@@ -509,7 +511,6 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
         lfe_top_k=args.lfe_top_k,
         lfe_calibration_samples=args.lfe_calibration_samples,
         defense=args.defense,
-        defense_clip_norm=args.defense_clip_norm,
         defense_trim_ratio=args.defense_trim_ratio,
         defense_krum_m=args.defense_krum_m,
         defense_num_malicious=args.defense_num_malicious,

@@ -493,14 +493,73 @@ def test_defense_median_filters_dense_outlier_but_passes_lone_cold_expert() -> N
     assert np.allclose(aggregated[2], baseline[2])  # untouched param stays at baseline
 
 
-def test_defense_norm_clip_scales_large_update() -> None:
-    strategy, _ = _build_strategy(mode="mix", num_clients=2, k=1)
+def test_defense_norm_clip_uses_per_round_median_mad_and_scales_large_update() -> None:
+    strategy, _ = _build_strategy(mode="mix", num_clients=3, k=1)
     strategy.defense = "norm_clip"
-    strategy.defense_clip_norm = 1.0
     baseline = _initial_arrays()
-    param_contribs = {0: [("0", np.array([10.0], np.float32), 10.0)]}  # update norm 10 -> clipped to 1
+    param_contribs = {
+        0: [
+            ("0", np.array([1.0], np.float32), 10.0),
+            ("1", np.array([3.0], np.float32), 10.0),
+            ("2", np.array([100.0], np.float32), 10.0),
+        ]
+    }
     aggregated = strategy._defense_aggregate(baseline, param_contribs)
-    assert np.allclose(aggregated[0], [1.0])
+    # median=3, MAD=2, k=3 gives a bound of 11.8956; only 100 is clipped.
+    clip_norm = 3.0 + 3.0 * 1.4826 * 2.0
+    assert np.allclose(aggregated[0], [(1.0 + 3.0 + clip_norm) / 3.0])
+    assert strategy._last_defense_metrics["defense_clip_norm"] == pytest.approx(clip_norm)
+    assert strategy._last_defense_metrics["defense_num_clipped"] == 1
+
+
+def test_defense_norm_clip_clips_shared_and_expert_groups_separately() -> None:
+    strategy, _ = _build_strategy(mode="mix", num_clients=3, k=1)
+    strategy.defense = "norm_clip"
+    baseline = _initial_arrays()
+    param_contribs = {
+        0: [
+            ("0", np.array([1.0], np.float32), 10.0),
+            ("1", np.array([3.0], np.float32), 10.0),
+            ("2", np.array([100.0], np.float32), 10.0),
+        ],
+        # This expert has one contributor. Its own group threshold equals 100,
+        # so it is not affected by the shared group's much smaller threshold.
+        1: [("2", np.array([100.0], np.float32), 10.0)],
+    }
+
+    aggregated = strategy._defense_aggregate(baseline, param_contribs)
+
+    shared_clip_norm = 3.0 + 3.0 * 1.4826 * 2.0
+    assert np.allclose(aggregated[0], [(1.0 + 3.0 + shared_clip_norm) / 3.0])
+    assert np.allclose(aggregated[1], [100.0])
+    assert strategy._last_defense_metrics["defense_num_clip_groups"] == 2
+    assert strategy._last_defense_metrics["defense_num_clipped"] == 1
+
+
+def test_defense_norm_clip_uses_k3_for_shared_and_k2_for_expert() -> None:
+    strategy, _ = _build_strategy(mode="mix", num_clients=4, k=1)
+    strategy.defense = "norm_clip"
+    baseline = _initial_arrays()
+    contributions = [
+        ("0", np.array([2.0], np.float32), 10.0),
+        ("1", np.array([3.0], np.float32), 10.0),
+        ("2", np.array([4.0], np.float32), 10.0),
+        ("3", np.array([7.0], np.float32), 10.0),
+    ]
+    param_contribs = {
+        0: contributions,  # shared group
+        1: contributions,  # encoder.0, expert 0
+    }
+
+    aggregated = strategy._defense_aggregate(baseline, param_contribs)
+
+    shared_bound = 3.5 + 3.0 * 1.4826
+    expert_bound = 3.5 + 2.0 * 1.4826
+    assert shared_bound > 7.0
+    assert expert_bound < 7.0
+    assert np.allclose(aggregated[0], [(2.0 + 3.0 + 4.0 + 7.0) / 4.0])
+    assert np.allclose(aggregated[1], [(2.0 + 3.0 + 4.0 + expert_bound) / 4.0])
+    assert strategy._last_defense_metrics["defense_num_clipped"] == 1
 
 
 def test_array_update_l2_uses_only_requested_parameter_indices() -> None:
@@ -611,3 +670,36 @@ def test_defense_multi_krum_drops_outlier_client() -> None:
     }
     aggregated = strategy._defense_aggregate(baseline, param_contribs)
     assert abs(float(aggregated[0][0])) < 1.0  # outlier excluded from the selected set
+
+
+def test_defense_multi_krum_selects_shared_and_expert_groups_separately() -> None:
+    strategy, _ = _build_strategy(mode="mix", num_clients=5, k=1)
+    strategy.defense = "multi_krum"
+    strategy.defense_num_malicious = 1
+    strategy.defense_krum_m = 0  # automatic: contributors in this group minus f
+    baseline = _initial_arrays()
+    param_contribs = {
+        # Client 3 is an outlier only in the shared group.
+        0: [
+            ("0", np.array([0.0], np.float32), 10.0),
+            ("1", np.array([0.1], np.float32), 10.0),
+            ("2", np.array([0.0], np.float32), 10.0),
+            ("3", np.array([50.0], np.float32), 10.0),
+            ("4", np.array([0.1], np.float32), 10.0),
+        ],
+        # A different contributor set trains expert 0; client 4 is its outlier.
+        1: [
+            ("1", np.array([1.0], np.float32), 10.0),
+            ("2", np.array([1.1], np.float32), 10.0),
+            ("3", np.array([1.0], np.float32), 10.0),
+            ("4", np.array([80.0], np.float32), 10.0),
+        ],
+    }
+
+    aggregated = strategy._defense_aggregate(baseline, param_contribs)
+
+    assert abs(float(aggregated[0][0])) < 1.0
+    assert 0.9 < float(aggregated[1][0]) < 1.2
+    assert strategy._last_defense_metrics["defense_num_krum_groups"] == 2
+    # Shared group keeps 5 - 1 clients; expert group independently keeps 4 - 1.
+    assert strategy._last_defense_metrics["defense_krum_total_selected"] == 7

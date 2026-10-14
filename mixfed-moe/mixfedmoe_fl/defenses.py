@@ -8,8 +8,9 @@ families:
 
   * Coordinate-wise robust means over a parameter's contributors
     (`coordinate_median`, `trimmed_mean`) — replace the weighted mean per param.
-  * Client-level operations over full update vectors
-    (`norm_clip_scale`, `multi_krum_select`) — reweight/select whole clients.
+  * Group/client operations over update vectors (`norm_clip_scale`,
+    `multi_krum_select`) — clip parameter groups or select clients within a
+    shared/expert parameter group.
 
 Key MoE consequence (why we port these): a COLD expert has a single contributor
 (the malicious client). Coordinate median / trimmed-mean of one value returns that
@@ -18,7 +19,7 @@ exactly on the cold expert the attack targets.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 
@@ -53,10 +54,26 @@ def trimmed_mean(values: Sequence[np.ndarray], trim_ratio: float) -> np.ndarray:
     return kept.mean(axis=0)
 
 
+def median_mad_clip_norm(update_norms: Iterable[float], k: float = 3.0) -> float:
+    """Return a robust per-round bound: median + k * 1.4826 * MAD."""
+    norms = np.asarray(list(update_norms), dtype=np.float64)
+    if norms.size == 0:
+        raise ValueError("median_mad_clip_norm requires at least one update norm.")
+    if np.any(~np.isfinite(norms)) or np.any(norms < 0.0):
+        raise ValueError("update norms must be finite and non-negative.")
+    if not np.isfinite(k) or k < 0.0:
+        raise ValueError("k must be finite and non-negative.")
+    median = float(np.median(norms))
+    mad = float(np.median(np.abs(norms - median)))
+    return median + float(k) * 1.4826 * mad
+
+
 def norm_clip_scale(update_norm: float, clip_norm: float) -> float:
     """Scale factor to clip an update's L2 norm to `clip_norm` (<=1, or 1 if within)."""
-    if clip_norm <= 0:
-        raise ValueError("clip_norm must be > 0.")
+    if update_norm < 0.0 or not np.isfinite(update_norm):
+        raise ValueError("update_norm must be finite and non-negative.")
+    if clip_norm < 0.0 or not np.isfinite(clip_norm):
+        raise ValueError("clip_norm must be finite and non-negative.")
     if update_norm <= clip_norm or update_norm == 0.0:
         return 1.0
     return float(clip_norm / update_norm)
@@ -67,10 +84,12 @@ def multi_krum_select(
     num_malicious: int,
     num_select: int,
 ) -> List[str]:
-    """(Multi-)Krum client selection over full flat update vectors.
+    """(Multi-)Krum client selection over comparable flat update vectors.
 
     Score(i) = sum of squared distances to its (n - f - 2) nearest neighbours;
     return the `num_select` clients with the smallest scores. num_select=1 is Krum.
+    The caller is responsible for constructing vectors from the same parameter
+    group; MixFedMoE calls this once for shared parameters and once per expert.
     """
     cids = list(vectors.keys())
     n = len(cids)

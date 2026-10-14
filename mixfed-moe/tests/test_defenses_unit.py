@@ -4,6 +4,7 @@ import numpy as np
 
 from mixfedmoe_fl.defenses import (
     coordinate_median,
+    median_mad_clip_norm,
     multi_krum_select,
     norm_clip_scale,
     trimmed_mean,
@@ -38,6 +39,12 @@ def test_single_contributor_defenses_degenerate_to_the_value() -> None:
 def test_norm_clip_scale() -> None:
     assert norm_clip_scale(3.0, clip_norm=5.0) == 1.0  # within bound
     assert np.isclose(norm_clip_scale(10.0, clip_norm=5.0), 0.5)  # clipped
+    assert norm_clip_scale(10.0, clip_norm=0.0) == 0.0
+
+
+def test_median_mad_clip_norm_uses_current_round_norms() -> None:
+    expected = 3.0 + 3.0 * 1.4826 * 2.0
+    assert median_mad_clip_norm([1.0, 3.0, 100.0], k=3.0) == expected
 
 
 def test_multi_krum_excludes_the_far_outlier() -> None:

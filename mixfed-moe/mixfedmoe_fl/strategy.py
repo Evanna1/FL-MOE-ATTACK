@@ -163,20 +163,18 @@ class MixFedMoEStrategy(FedAvg):
         self._last_activation_profiles: Dict[str, Dict[str, List[int]]] = {}
         self.cumulative_round_time: float = 0.0
         self._latest_fit_metrics: Dict[str, Scalar] = {}
+        self._last_defense_metrics: Dict[str, Scalar] = {}
 
         self.defense = str(getattr(self.runtime_config, "defense", "none"))
-        self.defense_clip_norm = float(getattr(self.runtime_config, "defense_clip_norm", 5.0))
         self.defense_trim_ratio = float(getattr(self.runtime_config, "defense_trim_ratio", 0.2))
         configured_malicious = int(getattr(self.runtime_config, "defense_num_malicious", 0))
         self.defense_num_malicious = (
             configured_malicious if configured_malicious > 0 else len(self.runtime_config.malicious_clients)
         )
         configured_m = int(getattr(self.runtime_config, "defense_krum_m", 0))
-        self.defense_krum_m = (
-            configured_m
-            if configured_m > 0
-            else max(1, int(self.runtime_config.num_clients) - self.defense_num_malicious)
-        )
+        # Keep zero as an automatic sentinel. Multi-Krum is applied separately to
+        # the shared group and every expert group, whose contributor counts differ.
+        self.defense_krum_m = configured_m
         if self.defense != "none" and self.runtime_config.mode != "mix":
             raise ValueError("Robust-aggregation defenses are implemented for mix mode only.")
 
@@ -629,11 +627,12 @@ class MixFedMoEStrategy(FedAvg):
     ) -> List[np.ndarray]:
         """Aggregate collected per-parameter contributions under a robust defense.
 
-        Client-level defenses (norm_clip, multi_krum) reweight/select whole clients
-        via their flat update vectors; coordinate defenses (coord_median,
-        trimmed_mean) replace the per-parameter weighted mean. A cold expert has a
-        single contributor, so median/trimmed/krum cannot filter it -- the defense
-        degenerates and the poisoned update passes through unchanged.
+        Norm clipping and Multi-Krum treat all non-expert parameters as one shared
+        group and each (layer, expert) as its own group. Multi-Krum selects clients
+        independently inside each group; coordinate defenses (coord_median,
+        trimmed_mean) replace the per-parameter weighted mean. A cold expert with
+        one contributor cannot be identified as an outlier by contributor-comparison
+        defenses.
         """
         client_param_delta: Dict[str, Dict[int, np.ndarray]] = {}
         for param_idx, contribs in param_contribs.items():
@@ -641,26 +640,132 @@ class MixFedMoEStrategy(FedAvg):
             for cid, value, _weight in contribs:
                 client_param_delta.setdefault(cid, {})[param_idx] = value.astype(np.float64) - base
 
-        scale: Dict[str, float] = {}
+        self._last_defense_metrics = {}
+        shared_group = ("shared", "", -1)
+        scale: Dict[Tuple[Tuple[str, str, int], str], float] = {}
         if self.defense == "norm_clip":
+            group_client_squared: Dict[Tuple[str, str, int], Dict[str, float]] = {}
             for cid, deltas in client_param_delta.items():
-                squared = sum(float(np.sum(delta * delta)) for delta in deltas.values())
-                scale[cid] = defenses.norm_clip_scale(math.sqrt(squared), self.defense_clip_norm)
+                for param_idx, delta in deltas.items():
+                    meta = self.expert_param_meta.get(param_idx)
+                    group = (
+                        ("expert", meta.layer_id, meta.expert_idx)
+                        if meta is not None
+                        else shared_group
+                    )
+                    client_squared = group_client_squared.setdefault(group, {})
+                    client_squared[cid] = client_squared.get(cid, 0.0) + float(
+                        np.sum(delta * delta)
+                    )
 
-        selected: Optional[set] = None
+            group_clip_norms: Dict[Tuple[str, str, int], float] = {}
+            all_update_norms: List[float] = []
+            for group, client_squared in group_client_squared.items():
+                update_norms = {
+                    cid: math.sqrt(squared) for cid, squared in client_squared.items()
+                }
+                clip_k = 3.0 if group == shared_group else 2.0
+                clip_norm = defenses.median_mad_clip_norm(update_norms.values(), k=clip_k)
+                group_clip_norms[group] = clip_norm
+                all_update_norms.extend(update_norms.values())
+                for cid, update_norm in update_norms.items():
+                    scale[(group, cid)] = defenses.norm_clip_scale(update_norm, clip_norm)
+
+            num_clipped = sum(value < 1.0 for value in scale.values())
+            min_update_norm = min(all_update_norms)
+            max_update_norm = max(all_update_norms)
+            min_clip_norm = min(group_clip_norms.values())
+            max_clip_norm = max(group_clip_norms.values())
+            self._last_defense_metrics = {
+                "defense_num_clipped": int(num_clipped),
+                "defense_num_clip_groups": int(len(group_clip_norms)),
+                "defense_min_update_norm": float(min_update_norm),
+                "defense_max_update_norm": float(max_update_norm),
+                "defense_min_group_clip_norm": float(min_clip_norm),
+                "defense_max_group_clip_norm": float(max_clip_norm),
+            }
+            if shared_group in group_clip_norms:
+                shared_clip_norm = float(group_clip_norms[shared_group])
+                self._last_defense_metrics["defense_clip_norm"] = shared_clip_norm
+                self._last_defense_metrics["defense_shared_clip_norm"] = shared_clip_norm
+            else:
+                shared_clip_norm = float("nan")
+            print(
+                "[MixFedMoE][norm_clip] "
+                f"groups={len(group_clip_norms)} shared_k=3 expert_k=2 "
+                f"shared_clip_norm={shared_clip_norm:.6f} "
+                f"group_clip_norm_range=[{min_clip_norm:.6f}, {max_clip_norm:.6f}] "
+                f"update_norm_range=[{min_update_norm:.6f}, {max_update_norm:.6f}] "
+                f"clipped_group_updates={num_clipped}/{len(scale)}",
+                flush=True,
+            )
+
+        selected_by_group: Dict[Tuple[str, str, int], set[str]] = {}
         if self.defense == "multi_krum":
-            all_idx = sorted({idx for deltas in client_param_delta.values() for idx in deltas})
-            vectors: Dict[str, np.ndarray] = {}
+            group_client_deltas: Dict[
+                Tuple[str, str, int], Dict[str, Dict[int, np.ndarray]]
+            ] = {}
             for cid, deltas in client_param_delta.items():
-                parts = [
-                    deltas[idx].ravel()
-                    if idx in deltas
-                    else np.zeros(baseline[idx].size, dtype=np.float64)
-                    for idx in all_idx
-                ]
-                vectors[cid] = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float64)
-            selected = set(
-                defenses.multi_krum_select(vectors, self.defense_num_malicious, self.defense_krum_m)
+                for param_idx, delta in deltas.items():
+                    meta = self.expert_param_meta.get(param_idx)
+                    group = (
+                        ("expert", meta.layer_id, meta.expert_idx)
+                        if meta is not None
+                        else shared_group
+                    )
+                    group_client_deltas.setdefault(group, {}).setdefault(cid, {})[
+                        param_idx
+                    ] = delta
+
+            contributor_counts: List[int] = []
+            selected_counts: List[int] = []
+            for group, client_deltas in group_client_deltas.items():
+                group_param_indices = sorted(
+                    {idx for deltas in client_deltas.values() for idx in deltas}
+                )
+                vectors: Dict[str, np.ndarray] = {}
+                for cid, deltas in client_deltas.items():
+                    parts = [
+                        deltas[idx].ravel()
+                        if idx in deltas
+                        else np.zeros(baseline[idx].size, dtype=np.float64)
+                        for idx in group_param_indices
+                    ]
+                    vectors[cid] = (
+                        np.concatenate(parts) if parts else np.zeros(1, dtype=np.float64)
+                    )
+
+                num_contributors = len(vectors)
+                num_select = (
+                    self.defense_krum_m
+                    if self.defense_krum_m > 0
+                    else max(1, num_contributors - self.defense_num_malicious - 2)
+                )
+                selected_by_group[group] = set(
+                    defenses.multi_krum_select(
+                        vectors,
+                        self.defense_num_malicious,
+                        num_select,
+                    )
+                )
+                contributor_counts.append(num_contributors)
+                selected_counts.append(len(selected_by_group[group]))
+
+            self._last_defense_metrics = {
+                "defense_num_krum_groups": int(len(selected_by_group)),
+                "defense_krum_total_contributors": int(sum(contributor_counts)),
+                "defense_krum_total_selected": int(sum(selected_counts)),
+                "defense_krum_min_group_contributors": int(min(contributor_counts)),
+                "defense_krum_max_group_contributors": int(max(contributor_counts)),
+            }
+            print(
+                "[MixFedMoE][multi_krum] "
+                f"groups={len(selected_by_group)} f={self.defense_num_malicious} "
+                f"configured_m={self.defense_krum_m} "
+                f"contributors_per_group=[{min(contributor_counts)}, {max(contributor_counts)}] "
+                f"selected_per_group=[{min(selected_counts)}, {max(selected_counts)}] "
+                f"selected_group_updates={sum(selected_counts)}/{sum(contributor_counts)}",
+                flush=True,
             )
 
         aggregated = [arr.copy() for arr in baseline]
@@ -668,12 +773,19 @@ class MixFedMoEStrategy(FedAvg):
             base = baseline[param_idx].astype(np.float64)
             values: List[np.ndarray] = []
             weights: List[float] = []
+            meta = self.expert_param_meta.get(param_idx)
+            group = (
+                ("expert", meta.layer_id, meta.expert_idx)
+                if meta is not None
+                else shared_group
+            )
+            selected = selected_by_group.get(group)
             for cid, value, weight in contribs:
                 if selected is not None and cid not in selected:
                     continue
                 current = value.astype(np.float64)
                 if self.defense == "norm_clip":
-                    current = base + scale.get(cid, 1.0) * (current - base)
+                    current = base + scale.get((group, cid), 1.0) * (current - base)
                 values.append(current)
                 weights.append(float(weight))
             if not values:
@@ -929,6 +1041,7 @@ class MixFedMoEStrategy(FedAvg):
             "cumulative_time": float(self.cumulative_round_time),
             "assignment_policy": self.runtime_config.assignment_policy,
         }
+        metrics_aggregated.update(self._last_defense_metrics)
         if weighted_train_examples > 0:
             metrics_aggregated["train_loss"] = float(weighted_train_loss / weighted_train_examples)
         if benign_target_activations:

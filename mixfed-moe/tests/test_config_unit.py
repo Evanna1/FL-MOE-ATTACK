@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from mixfedmoe_fl.config import SUPPORTED_DATASET_NAME_TO_HF, parse_config
+from mixfedmoe_fl.config import (
+    DEFAULT_BADNET_TRIGGER,
+    DEFAULT_BADNET_TRIGGER_TOKEN_IDS,
+    SUPPORTED_DATASET_NAME_TO_HF,
+    parse_config,
+)
 
 
 def test_emotion_uses_namespaced_huggingface_dataset_id() -> None:
@@ -102,7 +107,15 @@ def test_parse_config_accepts_badnet_options() -> None:
     assert cfg.target_label == 1
     assert cfg.attack_start_round == 3
     assert cfg.trigger == "bb"
+    assert cfg.trigger_token_ids == ()
     assert cfg.checkpoint_rounds == (2, 4)
+
+
+def test_badnet_defaults_to_badmagic_with_exact_token_ids() -> None:
+    cfg = parse_config(["--mode", "full", "--attack_enabled"])
+
+    assert cfg.trigger == DEFAULT_BADNET_TRIGGER == "BadMagic"
+    assert cfg.trigger_token_ids == DEFAULT_BADNET_TRIGGER_TOKEN_IDS == (3862, 22909, 447)
 
 
 def test_parse_config_accepts_checkpoint_path_and_legacy_alias() -> None:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import csv
+import logging
+import sys
 
 from mixfedmoe_fl.logging_utils import (
     RoundMetricsLogger,
     append_benign_lfe_activation_rows,
     build_timestamped_output_dir,
+    tee_output_to_log,
 )
 
 
@@ -14,6 +17,30 @@ def test_build_timestamped_output_dir() -> None:
     assert path.endswith("outputs/experiment/20260911_143025_123456") or path.endswith(
         "outputs\\experiment\\20260911_143025_123456"
     )
+
+
+def test_tee_output_to_log_mirrors_stdout_stderr_and_logging(tmp_path) -> None:
+    handler = logging.StreamHandler()
+    logger = logging.getLogger("mixfedmoe.test.run_log")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        with tee_output_to_log(str(tmp_path)) as log_path:
+            print("stdout message", flush=True)
+            with open(log_path, encoding="utf-8") as handle:
+                assert "stdout message" in handle.read()
+            print("stderr message", file=sys.stderr, flush=True)
+            logger.info("logging message")
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+    with open(log_path, encoding="utf-8") as handle:
+        contents = handle.read()
+    assert "stdout message" in contents
+    assert "stderr message" in contents
+    assert "logging message" in contents
 
 
 def test_attack_results_csv_is_created_and_logged(tmp_path) -> None:

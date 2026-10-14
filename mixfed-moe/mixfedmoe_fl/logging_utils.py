@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
+import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Iterator, TextIO
 
 from mixfedmoe_fl.config import MixFedMoEConfig
 
@@ -55,12 +59,128 @@ BENIGN_LFE_ACTIVATION_COLUMNS = [
 ]
 
 
+class _SharedLogSink:
+    """Thread-safe sink shared by the stdout and stderr tee streams."""
+
+    def __init__(self, path: str) -> None:
+        self.handle = open(path, "a", encoding="utf-8", buffering=1)
+        self.lock = threading.Lock()
+
+    def write(self, text: str) -> None:
+        with self.lock:
+            self.handle.write(text)
+            self.handle.flush()
+
+    def flush(self) -> None:
+        with self.lock:
+            self.handle.flush()
+
+    def close(self) -> None:
+        with self.lock:
+            self.handle.close()
+
+
+class _TeeStream:
+    """Mirror a text stream to a shared run log without hiding console output."""
+
+    def __init__(self, console: TextIO, sink: _SharedLogSink) -> None:
+        self.console = console
+        self.sink = sink
+
+    def write(self, text: str) -> int:
+        written = self.console.write(text)
+        self.sink.write(text)
+        return len(text) if written is None else written
+
+    def flush(self) -> None:
+        self.console.flush()
+        self.sink.flush()
+
+    def isatty(self) -> bool:
+        return self.console.isatty()
+
+    def fileno(self) -> int:
+        return self.console.fileno()
+
+    @property
+    def encoding(self) -> str | None:
+        return self.console.encoding
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.console, name)
+
+
+def _redirect_existing_console_handlers(
+    stdout: TextIO,
+    stderr: TextIO,
+    tee_stdout: _TeeStream,
+    tee_stderr: _TeeStream,
+) -> list[tuple[logging.StreamHandler[Any], TextIO]]:
+    """Point already-created console handlers at the corresponding tee."""
+    loggers = [logging.getLogger()]
+    loggers.extend(
+        logger
+        for logger in logging.root.manager.loggerDict.values()
+        if isinstance(logger, logging.Logger)
+    )
+    redirected: list[tuple[logging.StreamHandler[Any], TextIO]] = []
+    seen: set[int] = set()
+    for logger in loggers:
+        for handler in logger.handlers:
+            if id(handler) in seen or not isinstance(handler, logging.StreamHandler):
+                continue
+            seen.add(id(handler))
+            if handler.stream is stdout:
+                redirected.append((handler, stdout))
+                handler.setStream(tee_stdout)
+            elif handler.stream is stderr:
+                redirected.append((handler, stderr))
+                handler.setStream(tee_stderr)
+    return redirected
+
+
+@contextmanager
+def tee_output_to_log(
+    output_dir: str,
+    filename: str = "run.log",
+) -> Iterator[str]:
+    """Mirror stdout and stderr to a live log file under ``output_dir``.
+
+    Keeping stdout/stderr visible is useful for interactive runs, while line
+    buffering and an explicit flush make the same output available in the log
+    file while a long-running simulation is still in progress.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, filename)
+    sink = _SharedLogSink(log_path)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    tee_stdout = _TeeStream(original_stdout, sink)
+    tee_stderr = _TeeStream(original_stderr, sink)
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
+    redirected_handlers = _redirect_existing_console_handlers(
+        original_stdout,
+        original_stderr,
+        tee_stdout,
+        tee_stderr,
+    )
+    try:
+        yield log_path
+    finally:
+        for handler, original_stream in redirected_handlers:
+            handler.setStream(original_stream)
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        sink.close()
+
+
 def build_timestamped_output_dir(base_output_dir: str, timestamp: str | None = None) -> str:
     """Return a unique per-run directory below the configured output directory."""
     if not base_output_dir.strip():
         raise ValueError("base_output_dir must not be empty.")
     run_timestamp = timestamp or datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
-    return os.path.join(base_output_dir, run_timestamp)
+    return os.path.join(os.path.normpath(base_output_dir), run_timestamp)
 
 
 class RoundMetricsLogger:

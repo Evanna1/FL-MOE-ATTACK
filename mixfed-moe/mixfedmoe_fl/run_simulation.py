@@ -18,6 +18,7 @@ from mixfedmoe_fl.data import MixFedMoEDataManager
 from mixfedmoe_fl.logging_utils import (
     RoundMetricsLogger,
     build_timestamped_output_dir,
+    tee_output_to_log,
     write_run_config,
 )
 from mixfedmoe_fl.server import build_initial_parameters, make_central_evaluate_fn
@@ -125,29 +126,31 @@ def main() -> None:
         output_dir=build_timestamped_output_dir(runtime_config.output_dir),
     )
     os.makedirs(runtime_config.output_dir, exist_ok=True)
-    config_path = write_run_config(runtime_config, runtime_config.output_dir)
-    print(f"Run output directory: {runtime_config.output_dir}")
-    print(f"Saved run config to {config_path}")
+    with tee_output_to_log(runtime_config.output_dir) as log_path:
+        config_path = write_run_config(runtime_config, runtime_config.output_dir)
+        print(f"Run output directory: {runtime_config.output_dir}", flush=True)
+        print(f"Live run log: {log_path}", flush=True)
+        print(f"Saved run config to {config_path}", flush=True)
 
-    server_app = _build_server_app(runtime_config)
-    client_app = _build_client_app(runtime_config)
+        server_app = _build_server_app(runtime_config)
+        client_app = _build_client_app(runtime_config)
 
-    backend_config = {
-        "init_args": {"ignore_reinit_error": True, "include_dashboard": False},
-        "client_resources": {
-            "num_cpus": float(runtime_config.num_cpus_per_client),
-            "num_gpus": float(runtime_config.num_gpus_per_client),
-        },
-    }
+        backend_config = {
+            "init_args": {"ignore_reinit_error": True, "include_dashboard": False},
+            "client_resources": {
+                "num_cpus": float(runtime_config.num_cpus_per_client),
+                "num_gpus": float(runtime_config.num_gpus_per_client),
+            },
+        }
 
-    run_simulation(
-        server_app=server_app,
-        client_app=client_app,
-        num_supernodes=runtime_config.num_clients,
-        backend_name="ray",
-        backend_config=backend_config,
-        verbose_logging=False,
-    )
+        run_simulation(
+            server_app=server_app,
+            client_app=client_app,
+            num_supernodes=runtime_config.num_clients,
+            backend_name="ray",
+            backend_config=backend_config,
+            verbose_logging=False,
+        )
 
 
 if __name__ == "__main__":
