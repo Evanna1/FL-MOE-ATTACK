@@ -58,23 +58,17 @@ def test_attack_results_csv_is_created_and_logged(tmp_path) -> None:
 
     with open(logger.attack_csv_path, encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert rows == [
-        {
-            "round": "1",
-            "clean_accuracy": "0.75",
-            "asr": "0.5",
-            "trigger_target_probability": "",
-            "trigger_target_hit_rate": "",
-            "trigger_target_execution_rate": "",
-            "trigger_routing_tokens": "",
-            "target_expert_local_update_l2": "0.4",
-            "target_expert_local_relative_update_l2": "",
-            "target_expert_global_update_l2": "0.1",
-            "target_expert_global_relative_update_l2": "",
-            "target_expert_contributors": "5",
-            "num_malicious_target_updates": "",
-        }
-    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["round"] == "1"
+    assert row["clean_accuracy"] == "0.75"
+    assert row["asr"] == "0.5"
+    assert row["target_expert_local_update_l2"] == "0.4"
+    assert row["target_expert_global_update_l2"] == "0.1"
+    assert row["target_expert_contributors"] == "5"
+    assert "target_expert_aggregation_retention" in row
+    assert "target_router_local_update_l2" in row
+    assert "shared_local_update_l2" in row
 
 
 def test_benign_lfe_activation_csv_contains_clients_and_aggregate(tmp_path) -> None:

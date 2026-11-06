@@ -61,12 +61,45 @@ def _build_data_manager(test_samples: int) -> MixFedMoEDataManager:
     return manager
 
 
+def test_federated_dataset_uses_dirichlet_partitioner(monkeypatch) -> None:
+    captured = {}
+
+    class FakeDirichletPartitioner:
+        def __init__(self, **kwargs) -> None:
+            captured["partitioner_kwargs"] = kwargs
+
+    class FakeFederatedDataset:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(data_module, "DirichletPartitioner", FakeDirichletPartitioner)
+    monkeypatch.setattr(data_module, "FederatedDataset", FakeFederatedDataset)
+
+    manager = MixFedMoEDataManager(
+        config=_build_config(test_samples=3),
+        tokenizer=object(),  # type: ignore[arg-type]
+    )
+    manager._get_federated_dataset()
+
+    assert captured["partitioner_kwargs"] == {
+        "num_partitions": 2,
+        "partition_by": "label",
+        "alpha": 0.5,
+        "min_partition_size": 10,
+        "self_balancing": False,
+        "shuffle": True,
+        "seed": 7,
+    }
+    assert captured["dataset"] == "ag_news"
+    assert isinstance(captured["partitioners"]["train"], FakeDirichletPartitioner)
+
+
 def test_federated_dataset_uses_iid_partitioner(monkeypatch) -> None:
     captured = {}
 
     class FakeIidPartitioner:
-        def __init__(self, num_partitions: int) -> None:
-            captured["num_partitions"] = num_partitions
+        def __init__(self, **kwargs) -> None:
+            captured["partitioner_kwargs"] = kwargs
 
     class FakeFederatedDataset:
         def __init__(self, **kwargs) -> None:
@@ -76,12 +109,12 @@ def test_federated_dataset_uses_iid_partitioner(monkeypatch) -> None:
     monkeypatch.setattr(data_module, "FederatedDataset", FakeFederatedDataset)
 
     manager = MixFedMoEDataManager(
-        config=_build_config(test_samples=3),
+        config=replace(_build_config(test_samples=3), data_distribution="iid"),
         tokenizer=object(),  # type: ignore[arg-type]
     )
     manager._get_federated_dataset()
 
-    assert captured["num_partitions"] == 2
+    assert captured["partitioner_kwargs"] == {"num_partitions": 2}
     assert captured["dataset"] == "ag_news"
     assert isinstance(captured["partitioners"]["train"], FakeIidPartitioner)
 
@@ -130,6 +163,97 @@ def test_load_server_test_dataset_is_deterministic_for_same_seed(monkeypatch) ->
     assert first_ids == second_ids
 
 
+def test_client_can_use_global_random_examples_as_fixed_size_poison_source(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        data_module,
+        "_tokenize_split",
+        lambda split, tokenizer, max_length: split,
+    )
+    manager = _build_data_manager(test_samples=4)
+    manager.config = replace(
+        manager.config,
+        attack_enabled=True,
+        global_random_poison_source=True,
+        poison_rate=0.5,
+        target_label=0,
+        trigger="cf",
+        trigger_token_ids=(),
+    )
+    local_partition = Dataset.from_dict(
+        {
+            "text": ["local-a", "local-b", "local-c", "local-d"],
+            "label": [1, 1, 1, 1],
+        }
+    )
+
+    class FakeFederatedDataset:
+        def load_partition(self, partition_id, split):
+            assert partition_id == 0
+            assert split == "train"
+            return local_partition
+
+    manager._fds = FakeFederatedDataset()
+
+    bundle = manager.load_client_dataset(partition_id=0, apply_badnet=True)
+
+    poisoned_texts = [
+        text for text in bundle.train_dataset["text"] if text.endswith(" cf")
+    ]
+    assert bundle.num_train_examples == len(local_partition)
+    assert bundle.num_poisoned_examples == 2
+    assert sorted(poisoned_texts) == ["b cf", "d cf"]
+    assert all(label == 0 for text, label in zip(
+        bundle.train_dataset["text"], bundle.train_dataset["label"]
+    ) if text.endswith(" cf"))
+
+
+def test_only_malicious_client_can_use_an_iid_like_global_random_partition(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        data_module,
+        "_tokenize_split",
+        lambda split, tokenizer, max_length: split,
+    )
+    manager = _build_data_manager(test_samples=4)
+    manager.config = replace(
+        manager.config,
+        attack_enabled=True,
+        iid_malicious_client_data=True,
+    )
+    malicious_partition = Dataset.from_dict(
+        {
+            "text": ["mal-a", "mal-b", "mal-c", "mal-d"],
+            "label": [1, 1, 1, 1],
+        }
+    )
+    benign_partition = Dataset.from_dict(
+        {
+            "text": ["benign-a", "benign-b", "benign-c", "benign-d"],
+            "label": [1, 1, 1, 1],
+        }
+    )
+
+    class FakeFederatedDataset:
+        def load_partition(self, partition_id, split):
+            assert split == "train"
+            return malicious_partition if partition_id == 0 else benign_partition
+
+    manager._fds = FakeFederatedDataset()
+
+    malicious = manager.load_client_dataset(partition_id=0)
+    benign = manager.load_client_dataset(partition_id=1)
+
+    assert malicious.num_train_examples == len(malicious_partition)
+    assert set(malicious.train_dataset["text"]) == {"a", "b", "c", "d"}
+    assert malicious.train_dataset["label"].count(0) == 2
+    assert malicious.train_dataset["label"].count(1) == 2
+    assert benign.train_dataset["text"] == benign_partition["text"]
+    assert benign.train_dataset["label"] == benign_partition["label"]
+
+
 def test_monitor_asr_builds_only_a_server_side_triggered_test_set(monkeypatch) -> None:
     monkeypatch.setattr(
         data_module,
@@ -144,6 +268,49 @@ def test_monitor_asr_builds_only_a_server_side_triggered_test_set(monkeypatch) -
     assert bundle.triggered_test_dataset is not None
     assert 0 < len(bundle.triggered_test_dataset) <= 3
     assert all(label != manager.config.target_label for label in bundle.triggered_test_dataset["label"])
+
+
+def test_a3fl_does_not_build_a_server_side_triggered_test_set(monkeypatch) -> None:
+    monkeypatch.setattr(
+        data_module,
+        "_tokenize_split",
+        lambda split, tokenizer, max_length: split,
+    )
+    manager = _build_data_manager(test_samples=3)
+    manager.config = replace(
+        manager.config,
+        attack_enabled=True,
+        attack_mode="a3fl",
+        monitor_asr=True,
+    )
+
+    bundle = manager.load_server_test_dataset()
+
+    assert bundle.triggered_test_dataset is None
+
+
+def test_a3fl_builds_dynamic_triggered_test_set_from_reported_token_ids(monkeypatch) -> None:
+    monkeypatch.setattr(
+        data_module,
+        "_tokenize_split",
+        lambda split, tokenizer, max_length: split,
+    )
+    manager = _build_data_manager(test_samples=4)
+    manager.config = replace(
+        manager.config,
+        attack_enabled=True,
+        attack_mode="a3fl",
+        target_label=1,
+    )
+
+    triggered = manager.load_triggered_server_test_dataset(
+        trigger="unused-text-fallback",
+        trigger_token_ids=(70, 71),
+    )
+
+    assert 0 < len(triggered) <= 4
+    assert all(label == 0 for label in triggered["label"])
+    assert all(token_ids == [70, 71] for token_ids in triggered["_mixfedmoe_trigger_ids"])
 
 
 def test_tokenize_split_reserves_space_and_appends_exact_trigger_ids() -> None:

@@ -4,8 +4,9 @@ set -euo pipefail
 # Cold-expert backdoor PERSISTENCE experiment on the real flwr framework.
 #
 # Story: under memory-efficient FL-MoE (mix + hot policy + NO coverage guarantee),
-# honest clients never train the cold experts. A malicious client claims the target
-# cold expert (--inject_target_expert) and poisons it (BadNet). Because it is the
+# honest clients never train the cold experts. A malicious client promotes the target
+# cold expert through its reported activation profile (--inject_target_expert) and
+# poisons it from the following round (BadNet). Because it is the
 # sole aggregation contributor for that expert, its update is applied verbatim (no
 # FedAvg dilution) and PERSISTS after the attacker leaves (--attack_end_round).
 #

@@ -586,8 +586,13 @@ def test_aggregate_fit_reports_local_and_global_target_expert_updates() -> None:
         lfe_target_layer="encoder.0",
         lfe_target_expert=1,
         malicious_clients=(0,),
+        measure_local_asr=True,
     )
     strategy._current_global_arrays = _initial_arrays()
+    strategy._last_round_assignments = {
+        "0": {"encoder.0": [1]},
+        "1": {"encoder.0": [0]},
+    }
     names = _parameter_names()
     target_idx = names.index(
         "encoder.block.0.layer.1.mlp.experts.expert_1.wi.weight"
@@ -617,8 +622,10 @@ def test_aggregate_fit_reports_local_and_global_target_expert_updates() -> None:
                     "is_malicious": True,
                     "attack_active": True,
                     "assigned_experts_json": json.dumps({"encoder.0": [1]}),
-                    "target_expert_local_update_l2": 4.0,
-                    "target_expert_local_relative_update_l2": 0.25,
+                    "local_asr_pre": 0.1,
+                    "local_asr_post": 0.9,
+                    "local_asr_gain": 0.8,
+                    "local_asr_eval_examples": 100,
                 },
             ),
         ),
@@ -647,10 +654,14 @@ def test_aggregate_fit_reports_local_and_global_target_expert_updates() -> None:
     assert aggregated_parameters is not None
     aggregated = parameters_to_ndarrays(aggregated_parameters)
     assert aggregated[target_idx][0] == pytest.approx(9.0)
-    assert float(metrics["target_expert_local_update_l2"]) == pytest.approx(4.0)
-    assert float(metrics["target_expert_local_relative_update_l2"]) == pytest.approx(0.25)
+    assert float(metrics["target_expert_local_update_l2"]) == pytest.approx(9.0)
     assert float(metrics["target_expert_global_update_l2"]) == pytest.approx(9.0)
+    assert float(metrics["target_expert_update_norm_retention"]) == pytest.approx(1.0)
+    assert float(metrics["target_expert_aggregation_retention"]) == pytest.approx(1.0)
+    assert float(metrics["target_expert_update_cosine"]) == pytest.approx(1.0)
     assert int(metrics["target_expert_contributors"]) == 1
+    assert int(metrics["target_router_contributors"]) == 2
+    assert int(metrics["shared_contributors"]) == 2
     assert int(metrics["num_malicious_target_updates"]) == 1
 
 

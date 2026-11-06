@@ -7,6 +7,7 @@ from datasets import Dataset
 from mixfedmoe_fl.attack import (
     SelectedTrigger,
     add_trigger,
+    build_client_dataset_with_global_random_poison_source,
     build_triggered_test_dataset,
     load_attack_checkpoint,
     load_selected_trigger,
@@ -33,6 +34,50 @@ def test_poison_selection_is_exact_and_deterministic() -> None:
     second = select_poison_indices(num_examples=10, poison_rate=0.2, seed=42)
     assert first == second
     assert len(first) == 2
+
+
+def test_global_random_poison_source_is_deterministic_and_preserves_local_size() -> None:
+    local = Dataset.from_dict(
+        {
+            "text": [f"local-{index}" for index in range(8)],
+            "label": [1] * 8,
+        }
+    )
+    source = Dataset.from_dict(
+        {
+            "text": [
+                f"source-label-{label}-{index}"
+                for label in range(3)
+                for index in range(5)
+            ],
+            "label": [label for label in range(3) for _ in range(5)],
+        }
+    )
+
+    first, first_count = build_client_dataset_with_global_random_poison_source(
+        local_dataset=local,
+        source_dataset=source,
+        poison_rate=0.5,
+        target_label=0,
+        trigger="cf",
+        seed=17,
+    )
+    second, second_count = build_client_dataset_with_global_random_poison_source(
+        local_dataset=local,
+        source_dataset=source,
+        poison_rate=0.5,
+        target_label=0,
+        trigger="cf",
+        seed=17,
+    )
+
+    poisoned_texts = [text for text in first["text"] if text.endswith(" cf")]
+    assert len(first) == len(local)
+    assert first_count == second_count == 4
+    assert first["text"] == second["text"]
+    assert len(poisoned_texts) == first_count
+    assert all(text.startswith("source-label-") for text in poisoned_texts)
+    assert all(not text.startswith("source-label-0-") for text in poisoned_texts)
 
 
 def test_poison_dataset_changes_only_selected_examples() -> None:

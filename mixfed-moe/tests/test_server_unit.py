@@ -1,11 +1,63 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
+from flwr.common import ndarrays_to_parameters
+from flwr.server import SimpleClientManager
+from flwr.server.strategy import FedAvg
 from torch.utils.data import DataLoader
 
 from mixfedmoe_fl.config import parse_config
-from mixfedmoe_fl.server import _NaturalTriggerRoutingTracker, _make_eval_loader, _should_evaluate_asr
+from mixfedmoe_fl.server import (
+    ExpertProbeEarlyStoppingServer,
+    _NaturalTriggerRoutingTracker,
+    _make_eval_loader,
+    _should_evaluate_asr,
+)
+
+
+def test_expert_probe_server_stops_before_evaluation_and_next_round() -> None:
+    parameters = ndarrays_to_parameters([np.array([1.0], dtype=np.float32)])
+
+    class StopStrategy(FedAvg):
+        def __init__(self) -> None:
+            super().__init__(initial_parameters=parameters)
+            self.expert_probe_stop_requested = False
+            self.found_low_frequency_expert = None
+
+        def evaluate(self, server_round, parameters):
+            _ = server_round, parameters
+            return None
+
+    class StopServer(ExpertProbeEarlyStoppingServer):
+        def __init__(self, strategy) -> None:
+            super().__init__(
+                client_manager=SimpleClientManager(),
+                strategy=strategy,
+            )
+            self.completed_rounds = []
+
+        def fit_round(self, server_round, timeout):
+            _ = timeout
+            self.completed_rounds.append(server_round)
+            self.strategy.expert_probe_stop_requested = True
+            self.strategy.found_low_frequency_expert = {
+                "expert": "decoder.1/expert_7"
+            }
+            return self.parameters, {}, ([], [])
+
+        def evaluate_round(self, server_round, timeout):
+            raise AssertionError(
+                f"round {server_round} evaluation should not run after discovery"
+            )
+
+    strategy = StopStrategy()
+    server = StopServer(strategy)
+
+    server.fit(num_rounds=20, timeout=None)
+
+    assert server.completed_rounds == [1]
 
 
 def test_make_eval_loader_returns_none_for_missing_optional_dataset() -> None:
@@ -22,10 +74,20 @@ def test_make_eval_loader_builds_loader_for_present_dataset() -> None:
     assert next(iter(loader)) == [{"value": 1}, {"value": 2}]
 
 
-def test_monitor_asr_runs_only_after_completed_training_rounds() -> None:
+def test_monitor_asr_requests_evaluation_from_round_zero() -> None:
     cfg = parse_config(["--mode", "full", "--monitor_asr"])
 
-    assert _should_evaluate_asr(cfg, server_round=0) is False
+    assert _should_evaluate_asr(cfg, server_round=0) is True
+    assert _should_evaluate_asr(cfg, server_round=1) is True
+    assert _should_evaluate_asr(cfg, server_round=10) is True
+
+
+def test_a3fl_requests_asr_evaluation_from_round_zero() -> None:
+    cfg = parse_config(
+        ["--mode", "full", "--attack_enabled", "--attack_mode", "a3fl"]
+    )
+
+    assert _should_evaluate_asr(cfg, server_round=0) is True
     assert _should_evaluate_asr(cfg, server_round=1) is True
     assert _should_evaluate_asr(cfg, server_round=10) is True
 

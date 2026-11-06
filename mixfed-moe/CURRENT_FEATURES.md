@@ -47,7 +47,7 @@ python -m mixfedmoe_fl.run_simulation --mode full
 
 数据处理具备以下行为：
 
-- 使用 Flower Datasets 的 `IidPartitioner` 将训练集 IID 划分给客户端；
+- 通过 `--data_distribution` 在 IID 与 Dirichlet 标签偏斜 Non-IID 分区之间切换；
 - 数据集必须能规范化为 `text`、`label` 两列；
 - tokenizer 会为每条输入保留空间并追加 EOS；
 - 客户端使用完整本地分区训练，不创建本地验证集；
@@ -55,7 +55,7 @@ python -m mixfedmoe_fl.run_simulation --mode full
 - `--test_samples <= 0` 使用完整测试集，否则使用确定性打乱后的前 N 条样本；
 - 数据集、分区和随机行为由 `--seed` 控制。
 
-> 当前主训练管线只实现 IID 划分。`--alpha` 是兼容参数，不参与数据划分。因此，脚本中带有 `niid` 名称或传入不同 `alpha` 的运行，在主仿真里仍是 IID。
+> 默认使用 `non-iid`。此时 `--alpha` 控制 Dirichlet 浓度，值越小标签偏斜越强；选择 `iid` 时 `--alpha` 不参与划分。
 
 ## 4. 联邦训练流程
 
@@ -87,7 +87,7 @@ Flower 仿真使用 Ray 后端。每个客户端的 CPU/GPU 资源分别由 `--n
 
 支持两种策略：
 
-- `hot`：第一轮循环分配；后续轮次根据各客户端上一轮的专家激活次数排序，优先分配热专家。
+- `hot`：第一轮循环分配，但客户端只执行少量无梯度画像前向，不进行反向传播或参数更新；第二轮起根据各客户端上一轮的专家激活次数分配热专家并开始正式本地训练。
 - `random`：每轮使用由种子、轮次和层编号派生的随机数生成器，无放回随机选择 K 个专家。
 
 全局覆盖行为：
@@ -143,6 +143,8 @@ ASR 测试会排除真实标签已等于目标标签的样本，给其余测试�
 - 从非目标类别样本中确定性选取 `floor(本地样本数 × poison_rate)` 条；
 - 在文本末尾追加 `--trigger`，或插入优化器给出的精确 `trigger_token_ids`；
 - 将这些样本标签改为 `--target_label`；
+- 可选 `--global_random_poison_source` 对照实验：从完整训练集的非目标标签样本中随机抽取投毒源，并替换恶意客户端中等量本地样本；不执行标签均衡，客户端数据量及聚合权重保持不变；
+- 可选 `--iid_malicious_client_data` 对照实验：仅将恶意客户端的完整数据视图替换为从全局训练集随机抽取的等量样本，使其标签比例近似全局分布；良性客户端仍保留原 Non-IID 分区；
 - 使用投毒后的本地数据训练。
 
 `--malicious_clients` 支持一个或多个客户端 ID。攻击窗口由 `--attack_start_round` 和 `--attack_end_round` 控制；结束轮为 `0` 表示攻击者始终参与攻击。
@@ -157,7 +159,7 @@ ASR 测试会排除真实标签已等于目标标签的样本，给其余测试�
 
 ### 6.3 低频专家定向注入
 
-`--inject_target_expert` 允许恶意客户端偏离服务器分配，将目标专家强制放入目标层的 K 个上传槽位。攻击有效轮次会自动对精确 trigger token 位置的目标 Router 行施加交叉熵损失，无需额外的 Router 训练开关；`drop` 模式会自动把全局专家编号映射为裁剪后的本地 Router 行。
+`--inject_target_expert` 不再篡改服务端下发的 `assigned_experts`。若攻击计划从第 1～2 轮开始，恶意客户端会在第一轮画像预热时将目标低频专家的激活计数与当前 top-K 中第 K 名专家的计数交换，使服务端在第二轮首次正式训练前通过正常的 `hot` 策略选中目标专家；后续攻击轮继续采用相同交换逻辑。目标专家实际进入本轮分配后，客户端才会对精确 trigger token 位置的目标 Router 行施加交叉熵损失；`drop` 模式会自动把全局专家编号映射为裁剪后的本地 Router 行。
 
 目标可通过以下方式设置：
 
@@ -183,9 +185,13 @@ ASR 测试会排除真实标签已等于目标标签的样本，给其余测试�
 - Top-1 与 Top-2 的平均概率间隔；
 - 每层频率最低的前 K 个专家。
 
+第一轮是独立的画像预热轮：客户端最多抽取 `--lfe_calibration_samples` 条本地样本执行无梯度前向，只上传激活画像和未更新的模型参数，不生成训练 hook 画像；第二轮起才执行上述正式训练画像。
+
 统计会忽略 padding，并在 `drop` 模式下把局部专家 ID 映射回全局 ID。
 
 若配置了目标层和目标专家，即使未开启完整画像，系统也会跟踪该目标在真实本地训练中的激活，并汇总良性客户端结果。
+
+跨轮专家探测一旦完成全部确认，会把发现结果写入 `<run_dir>/expert_probe_discovery.json`，强制保存发现轮 checkpoint，并由服务端立即结束联邦轮次循环。完成态是终态，后续不会重新调度或注入探针。
 
 输出位置为：
 
@@ -253,7 +259,7 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 
 ## 9. 检查点与初始化
 
-默认在第 `5、10、15、20` 轮保存检查点，可用 `--checkpoint_rounds` 自定义；不跟任何值可禁用保存。
+默认每 `5` 轮持续保存检查点（包括第 25、30……轮），可用 `--checkpoint_interval` 调整周期，设为 `0` 可关闭周期保存。`--checkpoint_rounds` 仍可用于追加指定轮次；ASR 达到 1 时仍会立即保存，若恰逢周期轮则复用同一个轮次文件并同时记录两种保存原因。
 
 格式为：
 
@@ -303,6 +309,8 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | `--mode` | 必填 | `full/mix/drop/flex` |
 | `--model_name_or_path` | `model_ckpt/switch-base-8` | 模型目录或名称 |
 | `--dataset_name` | `ag_news` | 数据集 |
+| `--data_distribution`, `--data_mode` | `non-iid` | 客户端数据分区：`iid/non-iid`；兼容 `non_iid/noniid/niid` |
+| `--alpha` | `0.5` | Non-IID Dirichlet 浓度，值越小标签偏斜越强 |
 | `--num_clients` | `8` | 客户端总数 |
 | `--num_rounds` | `100` | 联邦轮数 |
 | `--K`, `--k` | `4` | 每层分配专家数 |
@@ -338,6 +346,8 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | `--monitor_asr` | 关闭 | 良性训练中监控自然 ASR |
 | `--malicious_clients` | `0` | 恶意客户端 ID 列表 |
 | `--poison_rate` | `0.1` | 投毒比例 |
+| `--global_random_poison_source` | 关闭 | 从完整训练集随机抽取投毒源并保持恶意客户端数据量不变 |
+| `--iid_malicious_client_data` | 关闭 | 仅将恶意客户端替换为等量的全局随机、近似 IID 数据视图 |
 | `--target_label` | `0` | 攻击目标标签 |
 | `--trigger` | `cf` | 文本触发器 |
 | `--attack_mode` | `badnet` | `badnet/neurotoxin` |
@@ -350,7 +360,8 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 | `--attack_end_round` | `0` | 攻击结束轮；0 表示不结束 |
 | `--malicious_lr` | `0` | 恶意学习率；0 表示沿用普通值 |
 | `--malicious_local_epochs` | `0` | 恶意本地 epoch；0 表示沿用普通值 |
-| `--inject_target_expert` | 关闭 | 强制目标专家进入恶意客户端分配，只训练目标专家 |
+| `--inject_target_expert` | 关闭 | 交换上传画像中的激活计数，使目标专家在下一轮进入恶意客户端 hot top-K；不修改服务端分配 |
+| `--malicious_target_expert_router_only` | 关闭 | 攻击轮仅更新目标专家和目标层 Router；其余参数保持下载值，目标专家尚未分配时仅更新 Router |
 | `--lfe_target_layer` | 空 | 目标 MoE 层，如 `encoder.5` |
 | `--lfe_target_expert` | 空 | 目标专家编号 |
 | `--selected_triggers_path` | 空 | I-GCG 的 `selected_triggers.json` |
@@ -359,11 +370,10 @@ python -m mixfedmoe_fl.run_igcg_trigger \
 
 | 参数 | 状态 |
 |---|---|
-| `--alpha` | 已废弃；主训练始终 IID |
 | `--client_eval_ratio` | 已废弃；客户端不划本地验证集 |
 | `--init_checkpoint` | `--checkpoint_path` 的别名 |
-| `--lfe_profile_trainings` | 兼容参数；训练 hook 画像按每个参与轮次执行 |
-| `--lfe_calibration_samples` | 兼容参数；训练 hook 使用实际训练批次 |
+| `--lfe_profile_trainings` | 兼容参数；训练 hook 画像从第二轮起按每个参与轮次执行 |
+| `--lfe_calibration_samples` | 第一轮预热及每轮快速激活画像前向使用的最大本地样本数，默认 `512` |
 完整、实时的参数帮助可通过下列命令查看：
 
 ```bash
@@ -462,8 +472,8 @@ python -m mixfedmoe_fl.run_simulation \
 | 文件 | 当前用途 |
 |---|---|
 | `shells/run_9_experiments.sh` | 当前实际只对 `20news/ag_news/emotion` 运行 `flex`，尽管文件名和注释仍称多模式实验 |
-| `shells/run_k_ablation.sh` | 对 K 值运行 `drop/mix/flex` 消融；注意主管线仍为 IID |
-| `shells/run_random_policy_ablation.sh` | 随机专家策略消融；不同 alpha 当前不会改变划分 |
+| `shells/run_k_ablation.sh` | 对 K 值运行 `drop/mix/flex` 消融 |
+| `shells/run_random_policy_ablation.sh` | 随机专家策略与数据分布消融 |
 | `shells/run_persistence_attack.sh` | 四组冷/热专家后门持久性对照 |
 | `shells/cache_datasets.sh` | 预下载部分常用数据集供离线运行 |
 | `shells/create_env.sh` | 创建开发环境并下载 Switch Base 8 |
@@ -517,7 +527,7 @@ pytest tests -v
 
 ## 16. 当前限制与注意事项
 
-- 主联邦数据划分只有 IID；真正的 Dirichlet Non-IID 仅存在于独立实验 `noniid_expert_usage.py` 中。
+- 主联邦数据划分支持 IID 与 Dirichlet 标签偏斜 Non-IID；Non-IID 的最小分区大小固定为 10。
 - 客户端没有本地验证流程，所有正式评估均在服务器完成。
 - Robust aggregation 当前仅支持 `mix`，不支持 `full/drop/flex`。
 - `flex` 只支持热度策略且 K 必须为 1。
@@ -533,7 +543,7 @@ pytest tests -v
 ```text
 mixfedmoe_fl/
 ├── config.py                     # CLI、配置与校验
-├── data.py                       # 数据加载、IID 分区、tokenization
+├── data.py                       # 数据加载、IID/Non-IID 分区、tokenization
 ├── client.py                     # 四种客户端模式、本地训练、攻击逻辑
 ├── strategy.py                   # 专家分配、稀疏聚合、防御接入、检查点
 ├── server.py                     # 服务端模型和集中评估

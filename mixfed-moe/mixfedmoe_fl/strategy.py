@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -27,7 +27,13 @@ from flwr.server.strategy import FedAvg
 
 from mixfedmoe_fl import defenses
 from mixfedmoe_fl.config import MixFedMoEConfig
-from mixfedmoe_fl.logging_utils import append_benign_lfe_activation_rows, append_expert_assignment_log
+from mixfedmoe_fl.logging_utils import (
+    append_benign_lfe_activation_rows,
+    append_expert_assignment_log,
+    append_expert_probe_reports,
+    append_poison_gradient_flow_reports,
+    write_expert_probe_discovery,
+)
 
 LAYER_ID_PATTERN = re.compile(r"^(encoder|decoder)\.(\d+)$")
 EXPERT_PARAM_PATTERN = re.compile(
@@ -87,6 +93,293 @@ def _parse_json_list_of_str(raw: str) -> List[str]:
     if not isinstance(payload, list):
         raise ValueError("Expected JSON list.")
     return [str(x) for x in payload]
+
+
+def _aggregate_local_asr_reports(
+    reports: Sequence[Tuple[str, Dict[str, Scalar]]],
+) -> Dict[str, Scalar]:
+    """Combine malicious-client ASR probes using their evaluation-set sizes."""
+
+    if not reports:
+        return {}
+
+    normalized: List[Dict[str, Any]] = []
+    for cid, metrics in reports:
+        examples_value = _as_float(metrics["local_asr_eval_examples"])
+        examples = int(examples_value)
+        if examples <= 0 or examples_value != float(examples):
+            raise ValueError(
+                f"Client {cid} reported invalid local ASR example count={examples_value}."
+            )
+        pre = _as_float(metrics["local_asr_pre"])
+        post = _as_float(metrics["local_asr_post"])
+        reported_gain = _as_float(metrics["local_asr_gain"])
+        if not 0.0 <= pre <= 1.0 or not 0.0 <= post <= 1.0:
+            raise ValueError(
+                f"Client {cid} reported local ASR outside [0, 1]: pre={pre}, post={post}."
+            )
+        if not math.isclose(reported_gain, post - pre, rel_tol=1e-6, abs_tol=1e-8):
+            raise ValueError(
+                f"Client {cid} reported inconsistent local ASR gain={reported_gain}; "
+                f"expected {post - pre}."
+            )
+        normalized.append(
+            {
+                "client_id": str(cid),
+                "pre": pre,
+                "post": post,
+                "gain": post - pre,
+                "examples": examples,
+            }
+        )
+
+    total_examples = sum(int(item["examples"]) for item in normalized)
+
+    def weighted(key: str) -> float:
+        return float(
+            sum(float(item[key]) * int(item["examples"]) for item in normalized)
+            / total_examples
+        )
+
+    local_pre = weighted("pre")
+    local_post = weighted("post")
+    return {
+        "local_asr_pre": local_pre,
+        "local_asr_post": local_post,
+        "local_asr_gain": float(local_post - local_pre),
+        "local_asr_eval_examples": int(total_examples),
+        "local_asr_num_clients": int(len(normalized)),
+        "local_asr_clients_json": json.dumps(normalized, sort_keys=True),
+    }
+
+
+def _array_update_l2(
+    before: Sequence[np.ndarray],
+    after: Sequence[np.ndarray],
+    indices: Sequence[int],
+) -> Tuple[float, float]:
+    """Return absolute and baseline-relative L2 update for selected tensors."""
+
+    if len(before) != len(after):
+        raise ValueError("before/after array collections must have the same length.")
+    update_squared = 0.0
+    baseline_squared = 0.0
+    for raw_index in indices:
+        index = int(raw_index)
+        if not 0 <= index < len(before):
+            raise IndexError(f"Parameter index {index} is outside [0, {len(before) - 1}].")
+        before_array = np.asarray(before[index], dtype=np.float64)
+        after_array = np.asarray(after[index], dtype=np.float64)
+        if before_array.shape != after_array.shape:
+            raise ValueError(
+                f"Parameter index {index} shape mismatch: "
+                f"before={before_array.shape}, after={after_array.shape}."
+            )
+        delta = after_array - before_array
+        update_squared += float(np.dot(delta.reshape(-1), delta.reshape(-1)))
+        baseline_squared += float(
+            np.dot(before_array.reshape(-1), before_array.reshape(-1))
+        )
+    absolute = math.sqrt(update_squared)
+    baseline_norm = math.sqrt(baseline_squared)
+    relative = absolute / baseline_norm if baseline_norm > 0.0 else (0.0 if absolute == 0.0 else float("inf"))
+    return float(absolute), float(relative)
+
+
+def _selected_update_statistics(
+    *,
+    before: Sequence[np.ndarray],
+    local_after: Mapping[int, np.ndarray],
+    global_after: Sequence[np.ndarray],
+    selections: Mapping[int, Optional[int]],
+) -> Dict[str, float]:
+    """Compare one local update with the global update on identical coordinates.
+
+    A selection value of ``None`` uses the complete tensor. An integer selects
+    one router row, allowing target-router retention to be measured without
+    unrelated expert rows inflating its norm.
+    """
+
+    local_squared = 0.0
+    global_squared = 0.0
+    baseline_squared = 0.0
+    dot_product = 0.0
+    used_coordinates = 0
+    for index, row in selections.items():
+        if index not in local_after:
+            continue
+        base = np.asarray(before[index], dtype=np.float64)
+        local = np.asarray(local_after[index], dtype=np.float64)
+        global_value = np.asarray(global_after[index], dtype=np.float64)
+        if base.shape != local.shape or base.shape != global_value.shape:
+            raise ValueError(
+                f"Diagnostic parameter index {index} shape mismatch: "
+                f"baseline={base.shape}, local={local.shape}, global={global_value.shape}."
+            )
+        if row is not None:
+            if base.ndim < 1 or not 0 <= int(row) < base.shape[0]:
+                raise ValueError(
+                    f"Diagnostic router row {row} is invalid for parameter index "
+                    f"{index} with shape={base.shape}."
+                )
+            base = base[int(row)]
+            local = local[int(row)]
+            global_value = global_value[int(row)]
+        local_delta = (local - base).reshape(-1)
+        global_delta = (global_value - base).reshape(-1)
+        local_squared += float(np.dot(local_delta, local_delta))
+        global_squared += float(np.dot(global_delta, global_delta))
+        baseline_vector = base.reshape(-1)
+        baseline_squared += float(np.dot(baseline_vector, baseline_vector))
+        dot_product += float(np.dot(local_delta, global_delta))
+        used_coordinates += int(local_delta.size)
+
+    if used_coordinates == 0:
+        return {}
+    local_l2 = math.sqrt(local_squared)
+    global_l2 = math.sqrt(global_squared)
+    baseline_l2 = math.sqrt(baseline_squared)
+    return {
+        "local_update_l2": float(local_l2),
+        "local_relative_update_l2": float(
+            local_l2 / baseline_l2
+            if baseline_l2 > 0.0
+            else (0.0 if local_l2 == 0.0 else float("inf"))
+        ),
+        "projection_retention": float(
+            dot_product / local_squared if local_squared > 0.0 else 0.0
+        ),
+        "update_cosine": float(
+            dot_product / (local_l2 * global_l2)
+            if local_l2 > 0.0 and global_l2 > 0.0
+            else 0.0
+        ),
+        "coordinates": float(used_coordinates),
+    }
+
+
+def _selected_global_update_l2(
+    *,
+    before: Sequence[np.ndarray],
+    after: Sequence[np.ndarray],
+    selections: Mapping[int, Optional[int]],
+) -> Tuple[float, float]:
+    update_squared = 0.0
+    baseline_squared = 0.0
+    for index, row in selections.items():
+        base = np.asarray(before[index], dtype=np.float64)
+        value = np.asarray(after[index], dtype=np.float64)
+        if base.shape != value.shape:
+            raise ValueError(
+                f"Global diagnostic parameter index {index} shape mismatch: "
+                f"baseline={base.shape}, aggregated={value.shape}."
+            )
+        if row is not None:
+            if base.ndim < 1 or not 0 <= int(row) < base.shape[0]:
+                raise ValueError(
+                    f"Diagnostic router row {row} is invalid for parameter index "
+                    f"{index} with shape={base.shape}."
+                )
+            base = base[int(row)]
+            value = value[int(row)]
+        delta = (value - base).reshape(-1)
+        base_vector = base.reshape(-1)
+        update_squared += float(np.dot(delta, delta))
+        baseline_squared += float(np.dot(base_vector, base_vector))
+    update_l2 = math.sqrt(update_squared)
+    baseline_l2 = math.sqrt(baseline_squared)
+    relative = (
+        update_l2 / baseline_l2
+        if baseline_l2 > 0.0
+        else (0.0 if update_l2 == 0.0 else float("inf"))
+    )
+    return float(update_l2), float(relative)
+
+
+def _aggregate_update_group_diagnostics(
+    *,
+    prefix: str,
+    before: Sequence[np.ndarray],
+    aggregated: Sequence[np.ndarray],
+    selections: Mapping[int, Optional[int]],
+    malicious_updates: Mapping[
+        str, Tuple[Mapping[int, np.ndarray], float]
+    ],
+    contributors: int,
+) -> Tuple[Dict[str, Scalar], List[Dict[str, Any]]]:
+    """Summarize local-to-global retention for one parameter group."""
+
+    if not selections:
+        return {}, []
+    global_l2, global_relative = _selected_global_update_l2(
+        before=before,
+        after=aggregated,
+        selections=selections,
+    )
+    reports: List[Dict[str, Any]] = []
+    for cid, (local_after, weight) in malicious_updates.items():
+        stats = _selected_update_statistics(
+            before=before,
+            local_after=local_after,
+            global_after=aggregated,
+            selections=selections,
+        )
+        if not stats:
+            continue
+        reports.append(
+            {
+                "client_id": str(cid),
+                "aggregation_weight": float(weight),
+                **stats,
+            }
+        )
+
+    metrics: Dict[str, Scalar] = {
+        f"{prefix}_global_update_l2": float(global_l2),
+        f"{prefix}_global_relative_update_l2": float(global_relative),
+        f"{prefix}_contributors": int(contributors),
+    }
+    malicious_count_key = (
+        "num_malicious_target_updates"
+        if prefix == "target_expert"
+        else f"{prefix}_num_malicious_updates"
+    )
+    metrics[malicious_count_key] = int(len(reports))
+    if not reports:
+        return metrics, reports
+
+    total_weight = sum(float(report["aggregation_weight"]) for report in reports)
+    if total_weight <= 0.0:
+        raise ValueError(f"{prefix} diagnostics contain no positive malicious weight.")
+
+    def weighted(key: str) -> float:
+        return float(
+            sum(
+                float(report[key]) * float(report["aggregation_weight"])
+                for report in reports
+            )
+            / total_weight
+        )
+
+    local_l2 = weighted("local_update_l2")
+    projection_retention = weighted("projection_retention")
+    metrics.update(
+        {
+            f"{prefix}_local_update_l2": local_l2,
+            f"{prefix}_local_relative_update_l2": weighted(
+                "local_relative_update_l2"
+            ),
+            # Norm retention says how large the aggregated movement is; signed
+            # projection retention says how much movement remains specifically
+            # in the malicious local-update direction.
+            f"{prefix}_update_norm_retention": float(
+                global_l2 / local_l2 if local_l2 > 0.0 else 0.0
+            ),
+            f"{prefix}_aggregation_retention": projection_retention,
+            f"{prefix}_update_cosine": weighted("update_cosine"),
+        }
+    )
+    return metrics, reports
 
 
 @dataclass(frozen=True)
@@ -161,9 +454,25 @@ class MixFedMoEStrategy(FedAvg):
         self._current_global_arrays: Optional[List[np.ndarray]] = None
         self._last_round_assignments: Dict[str, Dict[str, List[int]]] = {}
         self._last_activation_profiles: Dict[str, Dict[str, List[int]]] = {}
+        # Genuine profiles reported by malicious clients in the most recently
+        # aggregated round.  These let centralized evaluation undo a spoof
+        # from that same round when it discovers that ASR has reached 1.
+        self._latest_unspoofed_activation_profiles: Dict[
+            str, Dict[str, List[int]]
+        ] = {}
         self.cumulative_round_time: float = 0.0
         self._latest_fit_metrics: Dict[str, Scalar] = {}
         self._last_defense_metrics: Dict[str, Scalar] = {}
+        self._a3fl_eval_trigger_token_ids: Optional[List[int]] = None
+        self._a3fl_eval_trigger_text: Optional[str] = None
+        # Once a live attack reaches perfect centralized ASR, subsequent rounds
+        # become benign persistence rounds.  This is strategy state rather than a
+        # mutation of the frozen runtime config so it is also visible to newly
+        # constructed simulation clients through each round's FitIns config.
+        self._attack_stopped_on_asr: bool = False
+        self._attack_stop_round: Optional[int] = None
+        self._expert_probe_stop_requested: bool = False
+        self._found_low_frequency_expert: Optional[Dict[str, Any]] = None
 
         self.defense = str(getattr(self.runtime_config, "defense", "none"))
         self.defense_trim_ratio = float(getattr(self.runtime_config, "defense_trim_ratio", 0.2))
@@ -182,6 +491,113 @@ class MixFedMoEStrategy(FedAvg):
         if self.runtime_config.mode == "flex":
             return 1
         return int(self.runtime_config.k)
+
+    @property
+    def expert_probe_stop_requested(self) -> bool:
+        """Return whether the server should stop after the current fit round."""
+        return self._expert_probe_stop_requested
+
+    @property
+    def found_low_frequency_expert(self) -> Optional[Dict[str, Any]]:
+        """Return a copy of the terminal expert discovery, when available."""
+        if self._found_low_frequency_expert is None:
+            return None
+        return dict(self._found_low_frequency_expert)
+
+    def _record_expert_probe_discovery(
+        self,
+        *,
+        server_round: int,
+        reports: Sequence[Dict[str, Any]],
+        arrays: Sequence[np.ndarray],
+    ) -> None:
+        """Validate, persist, and expose a newly reported terminal discovery."""
+        if self._expert_probe_stop_requested:
+            return
+
+        discoveries: List[Dict[str, Any]] = []
+        for report in reports:
+            events = report.get("state_events", [])
+            if not isinstance(events, list):
+                raise ValueError("Expert probe state_events must be a list.")
+            found_events = [
+                event
+                for event in events
+                if isinstance(event, dict)
+                and event.get("event") == "low_frequency_expert_found"
+            ]
+            if not found_events:
+                continue
+            found = report.get("found_low_frequency_expert")
+            if not isinstance(found, dict):
+                raise ValueError(
+                    "Expert probe reported a discovery event without "
+                    "found_low_frequency_expert metadata."
+                )
+            for key in ("layer", "expert_id", "expert", "found_round"):
+                if key not in found:
+                    raise ValueError(
+                        f"Expert probe discovery is missing required field '{key}'."
+                    )
+            event = found_events[-1]
+            if (
+                str(event.get("layer")) != str(found["layer"])
+                or int(event.get("expert_id", -1)) != int(found["expert_id"])
+            ):
+                raise ValueError(
+                    "Expert probe discovery event disagrees with terminal metadata."
+                )
+            if int(found["found_round"]) != int(server_round):
+                raise ValueError(
+                    "Expert probe discovery round does not match the aggregation round."
+                )
+            discoveries.append(
+                {
+                    **found,
+                    "client_id": int(report["client_id"]),
+                    "reported_round": int(server_round),
+                }
+            )
+
+        if not discoveries:
+            return
+        identities = {
+            (str(item["layer"]), int(item["expert_id"]))
+            for item in discoveries
+        }
+        if len(identities) != 1:
+            raise ValueError(
+                f"Clients reported conflicting low-frequency experts: {sorted(identities)}."
+            )
+
+        discovery = discoveries[0]
+        self._found_low_frequency_expert = discovery
+        self._expert_probe_stop_requested = True
+        discovery_path = write_expert_probe_discovery(
+            self.runtime_config.output_dir,
+            discovery,
+        )
+        self._save_checkpoint(
+            server_round=server_round,
+            arrays=arrays,
+            force=True,
+            metadata={
+                "checkpoint_reason": "low_frequency_expert_found",
+                "found_low_frequency_expert": discovery,
+            },
+        )
+        retention = discovery.get("final_retention")
+        retention_text = (
+            "unknown" if retention is None else f"{float(retention):.6f}"
+        )
+        print(
+            "[MixFedMoE][EXPERT PROBE COMPLETE] "
+            f"Found low-frequency expert {discovery['expert']} "
+            f"(layer={discovery['layer']}, expert_id={int(discovery['expert_id'])}, "
+            f"round={server_round}, retention={retention_text}). "
+            f"Saved discovery to {discovery_path}. Stopping simulation.",
+            flush=True,
+        )
 
     def _assignment_rng(self, server_round: int, layer_id: str) -> np.random.Generator:
         stack_idx, layer_idx = _layer_sort_key(layer_id)
@@ -238,12 +654,29 @@ class MixFedMoEStrategy(FedAvg):
         metrics: Dict[str, Scalar],
         client_cid: str,
     ) -> Dict[str, List[int]]:
+        if client_cid not in self._last_round_assignments:
+            raise KeyError(
+                f"Server has no authoritative assignment for client {client_cid}."
+            )
+
+        authoritative = {
+            layer_id: sorted(set(vals))
+            for layer_id, vals in self._last_round_assignments[client_cid].items()
+        }
         if "assigned_experts_json" in metrics:
-            parsed = _parse_json_dict_of_int_lists(_as_str(metrics["assigned_experts_json"]))
-            return {layer_id: sorted(set(vals)) for layer_id, vals in parsed.items()}
-        if client_cid in self._last_round_assignments:
-            return self._last_round_assignments[client_cid]
-        raise KeyError(f"Client {client_cid} did not report assigned_experts_json.")
+            reported = _parse_json_dict_of_int_lists(
+                _as_str(metrics["assigned_experts_json"])
+            )
+            normalized_reported = {
+                layer_id: sorted(set(vals)) for layer_id, vals in reported.items()
+            }
+            if normalized_reported != authoritative:
+                raise ValueError(
+                    "Client-reported expert assignment does not match the "
+                    f"server-issued assignment for client {client_cid}: "
+                    f"reported={normalized_reported}, authoritative={authoritative}."
+                )
+        return authoritative
 
     def _preference_order(self, cid: str, layer_id: str, num_experts: int) -> List[int]:
         profile = self._last_activation_profiles.get(cid)
@@ -532,6 +965,17 @@ class MixFedMoEStrategy(FedAvg):
                 "weight_decay": float(self.runtime_config.weight_decay),
                 "train_batch_size": int(self.runtime_config.train_batch_size),
                 "eval_batch_size": int(self.runtime_config.eval_batch_size),
+                # This server-side switch can disable every malicious client from
+                # the round after perfect ASR is observed, even when Ray recreates
+                # the client object with the original runtime configuration.
+                "attack_enabled": bool(
+                    self.runtime_config.attack_enabled
+                    and not self._attack_stopped_on_asr
+                ),
+                "monitor_asr": bool(
+                    self.runtime_config.monitor_asr
+                    or self._attack_stopped_on_asr
+                ),
                 "incoming_parameter_names_json": incoming_names_json,
                 "assigned_experts_json": json.dumps(per_client_assignments[client.cid], sort_keys=True),
             }
@@ -831,7 +1275,64 @@ class MixFedMoEStrategy(FedAvg):
         weighted_train_examples = 0.0
         round_assignments: Dict[str, Dict[str, List[int]]] = {}
         next_profiles = dict(self._last_activation_profiles)
+        latest_unspoofed_profiles: Dict[str, Dict[str, List[int]]] = {}
         benign_target_activations: List[Dict[str, object]] = []
+        a3fl_eval_reports: List[Tuple[str, Dict[str, Scalar]]] = []
+        expert_probe_reports: List[Dict[str, Any]] = []
+        local_asr_reports: List[Tuple[str, Dict[str, Scalar]]] = []
+        poison_gradient_reports: List[Dict[str, Any]] = []
+        update_group_selections: Dict[str, Dict[int, Optional[int]]] = {}
+        target_layer = self.runtime_config.lfe_target_layer
+        target_expert = self.runtime_config.lfe_target_expert
+        if (
+            self.runtime_config.measure_local_asr
+            and self.runtime_config.mode == "mix"
+            and target_layer is not None
+            and target_expert is not None
+        ):
+            target_expert_selection = {
+                index: None
+                for index, meta in self.expert_param_meta.items()
+                if meta.layer_id == target_layer
+                and meta.expert_idx == int(target_expert)
+            }
+            target_router_selection = {
+                index: int(target_expert)
+                for index, meta in self.router_param_meta.items()
+                if meta.layer_id == target_layer
+            }
+            shared_selection = {
+                index: None
+                for index in range(len(self.parameter_names))
+                if index not in self.expert_param_meta
+                and index not in self.router_param_meta
+            }
+            if not target_expert_selection:
+                raise ValueError(
+                    f"No parameters found for target expert "
+                    f"{target_expert}@{target_layer}."
+                )
+            if not target_router_selection:
+                raise ValueError(
+                    f"No router parameters found for target layer '{target_layer}'."
+                )
+            update_group_selections = {
+                "target_expert": target_expert_selection,
+                "target_router": target_router_selection,
+                "shared": shared_selection,
+            }
+        diagnostic_groups_by_index: Dict[int, List[str]] = {}
+        for group_name, selections in update_group_selections.items():
+            for parameter_index in selections:
+                diagnostic_groups_by_index.setdefault(parameter_index, []).append(
+                    group_name
+                )
+        diagnostic_contributors: Dict[str, set[str]] = {
+            group_name: set() for group_name in update_group_selections
+        }
+        malicious_local_updates: Dict[
+            str, Tuple[Dict[int, np.ndarray], float]
+        ] = {}
 
         for client, fit_res in results:
             client_cid = client.cid
@@ -856,6 +1357,11 @@ class MixFedMoEStrategy(FedAvg):
                 profile = _parse_json_dict_of_int_lists(_as_str(metrics["expert_activation_map_json"]))
                 next_profiles[client_cid] = profile
 
+            if "unspoofed_expert_activation_map_json" in metrics:
+                latest_unspoofed_profiles[client_cid] = _parse_json_dict_of_int_lists(
+                    _as_str(metrics["unspoofed_expert_activation_map_json"])
+                )
+
             if "target_expert_activation_json" in metrics and not bool(metrics.get("is_malicious", False)):
                 target_activation = json.loads(_as_str(metrics["target_expert_activation_json"]))
                 if target_activation:
@@ -876,6 +1382,77 @@ class MixFedMoEStrategy(FedAvg):
                         }
                     )
 
+            if "a3fl_eval_trigger_token_ids_json" in metrics:
+                raw_trigger_ids = json.loads(
+                    _as_str(metrics["a3fl_eval_trigger_token_ids_json"])
+                )
+                if not isinstance(raw_trigger_ids, list) or not raw_trigger_ids:
+                    raise ValueError(
+                        f"Client {client_cid} reported an invalid A3FL evaluation trigger."
+                    )
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in raw_trigger_ids
+                ):
+                    raise ValueError(
+                        f"Client {client_cid} reported invalid A3FL evaluation token IDs."
+                    )
+                a3fl_eval_reports.append((client_cid, metrics))
+
+            if "local_asr_pre" in metrics or "local_asr_post" in metrics:
+                required_local_asr = {
+                    "local_asr_pre",
+                    "local_asr_post",
+                    "local_asr_gain",
+                    "local_asr_eval_examples",
+                }
+                missing_local_asr = required_local_asr.difference(metrics)
+                if missing_local_asr:
+                    raise ValueError(
+                        f"Client {client_cid} local ASR report is missing "
+                        f"{sorted(missing_local_asr)}."
+                    )
+                if mode != "mix":
+                    raise ValueError(
+                        f"Client {client_cid} reported local ASR in unsupported mode='{mode}'."
+                    )
+                local_asr_reports.append((client_cid, metrics))
+
+            if "expert_probe_report_json" in metrics:
+                probe_payload = json.loads(_as_str(metrics["expert_probe_report_json"]))
+                if not isinstance(probe_payload, dict):
+                    raise ValueError(
+                        f"Client {client_cid} reported a non-object expert probe payload."
+                    )
+                expert_probe_reports.append(
+                    {
+                        "round": int(server_round),
+                        "client_id": int(metrics.get("client_id", client_cid)),
+                        **probe_payload,
+                    }
+                )
+
+            if "poison_gradient_flow_json" in metrics:
+                gradient_payload = json.loads(
+                    _as_str(metrics["poison_gradient_flow_json"])
+                )
+                if not isinstance(gradient_payload, dict):
+                    raise ValueError(
+                        f"Client {client_cid} poison-gradient report is not an object."
+                    )
+                groups = gradient_payload.get("groups")
+                if not isinstance(groups, dict) or not groups:
+                    raise ValueError(
+                        f"Client {client_cid} poison-gradient report has no groups."
+                    )
+                poison_gradient_reports.append(
+                    {
+                        "round": int(server_round),
+                        "client_id": int(metrics.get("client_id", client_cid)),
+                        **gradient_payload,
+                    }
+                )
+
             if "returned_parameter_names_json" not in metrics:
                 raise KeyError(
                     f"Client {client_cid} did not report returned_parameter_names_json, which is required."
@@ -887,6 +1464,23 @@ class MixFedMoEStrategy(FedAvg):
                     f"Client {client_cid} returned parameter metadata mismatch: "
                     f"len(names)={len(returned_names)} len(arrays)={len(returned_arrays)}."
                 )
+
+            client_diagnostic_arrays: Dict[int, np.ndarray] = {}
+            client_diagnostic_groups: set[str] = set()
+            captures_malicious_update = "local_asr_pre" in metrics
+
+            def record_diagnostic_parameter(
+                parameter_index: int,
+                value: np.ndarray,
+            ) -> None:
+                groups = diagnostic_groups_by_index.get(parameter_index, [])
+                if not groups:
+                    return
+                client_diagnostic_groups.update(groups)
+                if captures_malicious_update:
+                    client_diagnostic_arrays[parameter_index] = np.asarray(
+                        value
+                    ).copy()
 
             for local_name, array in zip(returned_names, returned_arrays):
                 mapped_name = local_name
@@ -919,6 +1513,13 @@ class MixFedMoEStrategy(FedAvg):
                 param_idx = self.param_name_to_idx[mapped_name]
 
                 if self.defense == "none" and param_idx in self.router_param_meta:
+                    if mode == "mix" and array.shape != baseline[param_idx].shape:
+                        raise ValueError(
+                            f"Mix-mode router diagnostic shape mismatch for "
+                            f"'{mapped_name}': got={array.shape}, "
+                            f"expected={baseline[param_idx].shape}."
+                        )
+                    record_diagnostic_parameter(param_idx, array)
                     self._accumulate_router_rows(
                         router_row_sums=router_row_sums,
                         router_row_weights=router_row_weights,
@@ -947,6 +1548,8 @@ class MixFedMoEStrategy(FedAvg):
                     if meta.expert_idx not in assignments[meta.layer_id]:
                         continue
 
+                record_diagnostic_parameter(param_idx, array)
+
                 if self.defense == "none":
                     self._accumulate_dense(
                         dense_sums=dense_sums,
@@ -960,20 +1563,28 @@ class MixFedMoEStrategy(FedAvg):
                         (client_cid, array.astype(np.float32, copy=False), num_examples)
                     )
 
+            for group_name in client_diagnostic_groups:
+                diagnostic_contributors[group_name].add(client_cid)
+            if captures_malicious_update and client_diagnostic_arrays:
+                malicious_local_updates[client_cid] = (
+                    client_diagnostic_arrays,
+                    num_examples,
+                )
+
         enforce_global_coverage = self._requires_global_coverage()
         self._validate_round_coverage(round_assignments, enforce_global_coverage=enforce_global_coverage)
 
         # Per-expert contributor counts at the target layer: direct evidence that a
         # cold expert has ~1 (only the malicious) contributor and is thus applied
         # verbatim without FedAvg dilution, while hot experts are averaged over many.
-        target_layer = self.runtime_config.lfe_target_layer or (self.layer_ids[0] if self.layer_ids else None)
-        if target_layer and target_layer in self.layer_num_experts:
-            contrib = [0 for _ in range(self.layer_num_experts[target_layer])]
+        contributor_layer = self.runtime_config.lfe_target_layer or (self.layer_ids[0] if self.layer_ids else None)
+        if contributor_layer and contributor_layer in self.layer_num_experts:
+            contrib = [0 for _ in range(self.layer_num_experts[contributor_layer])]
             for client_assignment in round_assignments.values():
-                for expert_idx in client_assignment.get(target_layer, []):
+                for expert_idx in client_assignment.get(contributor_layer, []):
                     if 0 <= expert_idx < len(contrib):
                         contrib[expert_idx] += 1
-            print(f"[MixFedMoE][round={server_round}] contributors@{target_layer}: {contrib}", flush=True)
+            print(f"[MixFedMoE][round={server_round}] contributors@{contributor_layer}: {contrib}", flush=True)
 
         if enforce_global_coverage and self.defense != "none":
             for param_idx, meta in self.expert_param_meta.items():
@@ -1032,8 +1643,29 @@ class MixFedMoEStrategy(FedAvg):
         round_time = max(round_times) if round_times else 0.0
         self.cumulative_round_time += round_time
         self._last_activation_profiles = next_profiles
+        self._latest_unspoofed_activation_profiles = latest_unspoofed_profiles
         self._current_global_arrays = aggregated
         self._save_checkpoint(server_round=server_round, arrays=aggregated)
+        if expert_probe_reports:
+            append_expert_probe_reports(
+                self.runtime_config.output_dir,
+                expert_probe_reports,
+            )
+            self._record_expert_probe_discovery(
+                server_round=server_round,
+                reports=expert_probe_reports,
+                arrays=aggregated,
+            )
+        poison_gradient_jsonl_path = ""
+        poison_gradient_csv_path = ""
+        if poison_gradient_reports:
+            (
+                poison_gradient_jsonl_path,
+                poison_gradient_csv_path,
+            ) = append_poison_gradient_flow_reports(
+                self.runtime_config.output_dir,
+                poison_gradient_reports,
+            )
 
         metrics_aggregated: Dict[str, Scalar] = {
             "num_clients_sampled": int(len(results)),
@@ -1041,9 +1673,100 @@ class MixFedMoEStrategy(FedAvg):
             "cumulative_time": float(self.cumulative_round_time),
             "assignment_policy": self.runtime_config.assignment_policy,
         }
+        if poison_gradient_reports:
+            metrics_aggregated.update(
+                {
+                    "poison_gradient_flow_num_clients": int(
+                        len(poison_gradient_reports)
+                    ),
+                    "poison_gradient_flow_jsonl_path": poison_gradient_jsonl_path,
+                    "poison_gradient_flow_csv_path": poison_gradient_csv_path,
+                }
+            )
+        if self._expert_probe_stop_requested:
+            found = self._found_low_frequency_expert or {}
+            metrics_aggregated.update(
+                {
+                    "expert_probe_stop_requested": True,
+                    "found_low_frequency_expert": str(found.get("expert", "")),
+                    "found_low_frequency_expert_layer": str(found.get("layer", "")),
+                    "found_low_frequency_expert_id": int(found.get("expert_id", -1)),
+                }
+            )
         metrics_aggregated.update(self._last_defense_metrics)
         if weighted_train_examples > 0:
             metrics_aggregated["train_loss"] = float(weighted_train_loss / weighted_train_examples)
+        metrics_aggregated.update(_aggregate_local_asr_reports(local_asr_reports))
+        if local_asr_reports and update_group_selections:
+            diagnostic_payload: Dict[str, Any] = {}
+            for group_name, selections in update_group_selections.items():
+                group_metrics, client_reports = _aggregate_update_group_diagnostics(
+                    prefix=group_name,
+                    before=baseline,
+                    aggregated=aggregated,
+                    selections=selections,
+                    malicious_updates=malicious_local_updates,
+                    contributors=len(diagnostic_contributors[group_name]),
+                )
+                metrics_aggregated.update(group_metrics)
+                diagnostic_payload[group_name] = {
+                    "contributors": len(diagnostic_contributors[group_name]),
+                    "clients": client_reports,
+                }
+            metrics_aggregated["parameter_update_diagnostics_json"] = json.dumps(
+                diagnostic_payload,
+                sort_keys=True,
+            )
+            print(
+                f"[MixFedMoE][round={server_round}] update retention: "
+                + " ".join(
+                    f"{group_name}(local_l2="
+                    f"{float(metrics_aggregated.get(f'{group_name}_local_update_l2', 0.0)):.6g},"
+                    f"global_l2="
+                    f"{float(metrics_aggregated.get(f'{group_name}_global_update_l2', 0.0)):.6g},"
+                    f"projection="
+                    f"{float(metrics_aggregated.get(f'{group_name}_aggregation_retention', 0.0)):.6g},"
+                    f"contributors="
+                    f"{int(metrics_aggregated.get(f'{group_name}_contributors', 0))})"
+                    for group_name in update_group_selections
+                ),
+                flush=True,
+            )
+        if a3fl_eval_reports:
+            reported_eval_triggers = {
+                tuple(
+                    int(value)
+                    for value in json.loads(
+                        _as_str(metrics["a3fl_eval_trigger_token_ids_json"])
+                    )
+                )
+                for _cid, metrics in a3fl_eval_reports
+            }
+            if len(reported_eval_triggers) != 1:
+                raise ValueError(
+                    "Malicious clients used different A3FL triggers in the same round."
+                )
+            _leader_cid, leader_metrics = min(
+                a3fl_eval_reports, key=lambda item: _cid_sort_key(item[0])
+            )
+            self._a3fl_eval_trigger_token_ids = [
+                int(value)
+                for value in json.loads(
+                    _as_str(leader_metrics["a3fl_eval_trigger_token_ids_json"])
+                )
+            ]
+            self._a3fl_eval_trigger_text = _as_str(
+                leader_metrics.get("a3fl_eval_trigger_text", "")
+            )
+        if self._a3fl_eval_trigger_token_ids is not None:
+            # Retain the last attack-window trigger to measure post-attack ASR
+            # and lifespan, matching the BadNet centralized evaluation flow.
+            metrics_aggregated["a3fl_eval_trigger_token_ids_json"] = json.dumps(
+                self._a3fl_eval_trigger_token_ids
+            )
+            metrics_aggregated["a3fl_eval_trigger_text"] = (
+                self._a3fl_eval_trigger_text or ""
+            )
         if benign_target_activations:
             target_keys = {
                 (str(item["layer_id"]), int(item["expert_id"]))
@@ -1095,9 +1818,37 @@ class MixFedMoEStrategy(FedAvg):
 
         return ndarrays_to_parameters(aggregated), metrics_aggregated
 
-    def _save_checkpoint(self, server_round: int, arrays: Sequence[np.ndarray]) -> None:
-        if server_round not in self.runtime_config.checkpoint_rounds:
+    def _save_checkpoint(
+        self,
+        server_round: int,
+        arrays: Sequence[np.ndarray],
+        *,
+        force: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        checkpoint_interval = int(
+            getattr(self.runtime_config, "checkpoint_interval", 5)
+        )
+        is_periodic_round = (
+            server_round > 0
+            and checkpoint_interval > 0
+            and server_round % checkpoint_interval == 0
+        )
+        is_configured_round = server_round in self.runtime_config.checkpoint_rounds
+        if not force and not is_periodic_round and not is_configured_round:
             return
+
+        reasons: List[str] = []
+        if is_periodic_round:
+            reasons.append("periodic_interval")
+        if is_configured_round:
+            reasons.append("configured_round")
+        event_reason = metadata.get("checkpoint_reason") if metadata else None
+        if event_reason is not None and str(event_reason) not in reasons:
+            reasons.append(str(event_reason))
+        if force and not reasons:
+            reasons.append("forced")
+
         checkpoint_dir = os.path.join(self.runtime_config.output_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
         checkpoint_path = os.path.join(checkpoint_dir, f"round_{server_round:04d}.pt")
@@ -1105,15 +1856,40 @@ class MixFedMoEStrategy(FedAvg):
             name: torch.from_numpy(array.copy())
             for name, array in zip(self.parameter_names, arrays)
         }
-        torch.save(
-            {
-                "round": int(server_round),
-                "parameter_names": list(self.parameter_names),
-                "state_dict": state_dict,
-            },
-            checkpoint_path,
-        )
+        payload: Dict[str, Any] = {
+            "round": int(server_round),
+            "parameter_names": list(self.parameter_names),
+            "state_dict": state_dict,
+            "checkpoint_reason": reasons[-1],
+            "checkpoint_reasons": reasons,
+        }
+        if metadata:
+            payload.update(metadata)
+        torch.save(payload, checkpoint_path)
         print(f"[MixFedMoE] Saved checkpoint: {checkpoint_path}", flush=True)
+
+    def _is_live_attack_round(self, server_round: int) -> bool:
+        """Return whether this round contains malicious local optimization."""
+        if not self.runtime_config.attack_enabled or self._attack_stopped_on_asr:
+            return False
+        # Client round one is always a routing-profile warmup without updates.
+        if server_round < max(2, int(self.runtime_config.attack_start_round)):
+            return False
+        end_round = int(self.runtime_config.attack_end_round)
+        return end_round <= 0 or server_round <= end_round
+
+    def _is_persistence_monitor_round(self, server_round: int) -> bool:
+        if self.runtime_config.monitor_asr:
+            return True
+        if not self.runtime_config.attack_enabled:
+            return False
+        if self._attack_stopped_on_asr:
+            return bool(
+                self._attack_stop_round is not None
+                and server_round > self._attack_stop_round
+            )
+        end_round = int(self.runtime_config.attack_end_round)
+        return end_round > 0 and server_round > end_round
 
     def evaluate(self, server_round: int, parameters: Parameters) -> tuple[float, Dict[str, Scalar]] | None:
         """Centralized server-side evaluation callback wrapper."""
@@ -1127,6 +1903,8 @@ class MixFedMoEStrategy(FedAvg):
             "mode": self.runtime_config.mode,
             "assignment_policy": self.runtime_config.assignment_policy,
             "test_samples": int(self.runtime_config.test_samples),
+            "attack_enabled": self._is_live_attack_round(server_round),
+            "monitor_asr": self._is_persistence_monitor_round(server_round),
         }
         if "train_loss" in self._latest_fit_metrics:
             eval_config["train_loss"] = _as_float(self._latest_fit_metrics["train_loss"])
@@ -1135,9 +1913,23 @@ class MixFedMoEStrategy(FedAvg):
             "benign_lfe_activation_count",
             "benign_lfe_valid_tokens",
             "num_benign_clients_profiled",
+            "a3fl_eval_trigger_token_ids_json",
+            "a3fl_eval_trigger_text",
+            "local_asr_pre",
+            "local_asr_post",
+            "local_asr_gain",
+            "local_asr_eval_examples",
+            "local_asr_num_clients",
+            "local_asr_clients_json",
         ):
             if key in self._latest_fit_metrics:
                 eval_config[key] = self._latest_fit_metrics[key]
+        for key, value in self._latest_fit_metrics.items():
+            if key.startswith(("target_expert_", "target_router_", "shared_")) or key in {
+                "num_malicious_target_updates",
+                "parameter_update_diagnostics_json",
+            }:
+                eval_config[key] = value
 
         parameters_ndarrays = parameters_to_ndarrays(parameters)
         eval_res = self.evaluate_fn(server_round, parameters_ndarrays, eval_config)
@@ -1148,6 +1940,55 @@ class MixFedMoEStrategy(FedAvg):
         for key, value in eval_config.items():
             if key not in merged_metrics:
                 merged_metrics[key] = value
+
+        asr_value = merged_metrics.get("asr")
+        if (
+            not self._attack_stopped_on_asr
+            and self._is_live_attack_round(server_round)
+            and asr_value is not None
+            and _as_float(asr_value) >= 1.0
+        ):
+            perfect_asr = _as_float(asr_value)
+            restored_profiles: List[str] = []
+            removed_profiles: List[str] = []
+            for malicious_client_id in self.runtime_config.malicious_clients:
+                client_cid = str(malicious_client_id)
+                genuine_profile = self._latest_unspoofed_activation_profiles.get(
+                    client_cid
+                )
+                if genuine_profile is not None:
+                    self._last_activation_profiles[client_cid] = genuine_profile
+                    restored_profiles.append(client_cid)
+                elif client_cid in self._last_activation_profiles:
+                    # Be conservative with clients that do not provide the new
+                    # genuine-profile field: dropping their cached profile is
+                    # safer than carrying a potentially spoofed one into the
+                    # first persistence-monitoring round.
+                    del self._last_activation_profiles[client_cid]
+                    removed_profiles.append(client_cid)
+            self._save_checkpoint(
+                server_round=server_round,
+                arrays=parameters_ndarrays,
+                force=True,
+                metadata={
+                    "asr": perfect_asr,
+                    "attack_stopped_on_asr": True,
+                    "attack_stop_round": int(server_round),
+                    "checkpoint_reason": "asr_reached_1",
+                },
+            )
+            self._attack_stopped_on_asr = True
+            self._attack_stop_round = int(server_round)
+            merged_metrics["attack_stopped_on_asr"] = True
+            merged_metrics["attack_stop_round"] = int(server_round)
+            print(
+                f"[MixFedMoE][round={server_round}] ASR={perfect_asr:.6f} reached 1.0; "
+                "checkpoint saved, current-round malicious activation-profile "
+                f"spoofs were discarded (restored={restored_profiles}, "
+                f"removed={removed_profiles}), and attacks are disabled from the next round. "
+                "Continuing with monitor_asr persistence evaluation.",
+                flush=True,
+            )
         return float(loss), merged_metrics
 
     def aggregate_evaluate(

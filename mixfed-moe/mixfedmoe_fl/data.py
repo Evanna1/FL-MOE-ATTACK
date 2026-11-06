@@ -6,17 +6,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from datasets import Dataset
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from mixfedmoe_fl.attack import build_triggered_test_dataset, poison_text_classification_dataset
+from mixfedmoe_fl.attack import (
+    build_client_dataset_with_global_random_poison_source,
+    build_triggered_test_dataset,
+    poison_text_classification_dataset,
+)
 from mixfedmoe_fl.config import MixFedMoEConfig, SUPPORTED_DATASET_NAME_TO_HF, supported_dataset_names
 
 try:
     from flwr_datasets import FederatedDataset
-    from flwr_datasets.partitioner import IidPartitioner
-    # from flwr_datasets.partitioner import DirichletPartitioner
+    from flwr_datasets.partitioner import DirichletPartitioner, IidPartitioner
 except ImportError:
     FederatedDataset = None  # type: ignore[assignment]
+    DirichletPartitioner = None  # type: ignore[assignment]
     IidPartitioner = None  # type: ignore[assignment]
-    # DirichletPartitioner = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,7 @@ def _tokenize_split(
 
     def tokenize_batch(batch: Dict[str, List[Any]]) -> Dict[str, Any]:
         per_row_trigger_ids = batch.get("_mixfedmoe_trigger_ids")
+        per_row_poison_flags = batch.get("_mixfedmoe_is_poisoned")
         if per_row_trigger_ids is not None:
             output_ids: List[List[int]] = []
             output_masks: List[List[int]] = []
@@ -155,7 +159,16 @@ def _tokenize_split(
                 output_ids.append(ids)
                 output_masks.append([1] * len(ids))
             labels: List[int] = [int(x) for x in batch["label"]]
-            return {"input_ids": output_ids, "attention_mask": output_masks, "labels": labels}
+            result: Dict[str, Any] = {
+                "input_ids": output_ids,
+                "attention_mask": output_masks,
+                "labels": labels,
+            }
+            if per_row_poison_flags is not None:
+                result["is_poisoned"] = [
+                    int(bool(value)) for value in per_row_poison_flags
+                ]
+            return result
 
         encodings: Dict[str, Any] = tokenizer(
             batch["text"],
@@ -172,10 +185,22 @@ def _tokenize_split(
             max_length=max_length,
         )
         labels: List[int] = [int(x) for x in batch["label"]]
-        return {"input_ids": fixed_ids, "attention_mask": fixed_masks, "labels": labels}
+        result = {
+            "input_ids": fixed_ids,
+            "attention_mask": fixed_masks,
+            "labels": labels,
+        }
+        if per_row_poison_flags is not None:
+            result["is_poisoned"] = [
+                int(bool(value)) for value in per_row_poison_flags
+            ]
+        return result
 
     tokenized = split.map(tokenize_batch, batched=True, remove_columns=split.column_names)
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    tensor_columns = ["input_ids", "attention_mask", "labels"]
+    if "is_poisoned" in tokenized.column_names:
+        tensor_columns.append("is_poisoned")
+    tokenized.set_format(type="torch", columns=tensor_columns)
     return tokenized
 
 
@@ -198,6 +223,22 @@ def _build_label_info(train_split: Dataset) -> LabelInfo:
     )
 
 
+def _sample_iid_like_partition(
+    source_dataset: Dataset,
+    num_examples: int,
+    seed: int,
+) -> Dataset:
+    """Draw a deterministic global random sample for one experimental client."""
+    if num_examples < 0:
+        raise ValueError("num_examples must be >= 0.")
+    if num_examples > len(source_dataset):
+        raise ValueError(
+            "Global training split is smaller than the requested malicious-client "
+            f"sample: required={num_examples}, available={len(source_dataset)}."
+        )
+    return source_dataset.shuffle(seed=seed).select(range(num_examples))
+
+
 @dataclass
 class MixFedMoEDataManager:
     config: MixFedMoEConfig
@@ -215,24 +256,38 @@ class MixFedMoEDataManager:
     def _get_federated_dataset(self) -> Any:
         if self._fds is not None:
             return self._fds
-        if FederatedDataset is None or IidPartitioner is None:
+        if FederatedDataset is None:
             raise ImportError(
                 "flwr_datasets is required for MixFedMoE data loading. "
                 "Please use the `flwr` conda environment."
             )
 
         hf_dataset_name = resolve_hf_dataset_name(self.config.dataset_name)
-        partitioner = IidPartitioner(num_partitions=self.config.num_clients)
-        # Non-IID: label-skewed Dirichlet partition; smaller --alpha means stronger skew.
-        # partitioner = DirichletPartitioner(
-        #     num_partitions=self.config.num_clients,
-        #     partition_by="label",
-        #     alpha=self.config.alpha,
-        #     min_partition_size=10,
-        #     self_balancing=False,
-        #     shuffle=True,
-        #     seed=self.config.seed,
-        # )
+        if self.config.data_distribution == "iid":
+            if IidPartitioner is None:
+                raise ImportError(
+                    "IidPartitioner is unavailable in the installed flwr_datasets package."
+                )
+            partitioner = IidPartitioner(num_partitions=self.config.num_clients)
+        elif self.config.data_distribution == "non-iid":
+            if DirichletPartitioner is None:
+                raise ImportError(
+                    "DirichletPartitioner is unavailable in the installed flwr_datasets package."
+                )
+            # Smaller alpha means stronger per-client label skew.
+            partitioner = DirichletPartitioner(
+                num_partitions=self.config.num_clients,
+                partition_by="label",
+                alpha=self.config.alpha,
+                min_partition_size=10,
+                self_balancing=False,
+                shuffle=True,
+                seed=self.config.seed,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported data distribution: {self.config.data_distribution!r}."
+            )
         self._fds = FederatedDataset(
             dataset=hf_dataset_name,
             partitioners={"train": partitioner},
@@ -266,7 +321,15 @@ class MixFedMoEDataManager:
         self._label_info = _build_label_info(train_split)
         return self._label_info
 
-    def load_client_dataset(self, partition_id: int, apply_badnet: bool = False) -> ClientDatasetBundle:
+    def load_client_dataset(
+        self,
+        partition_id: int,
+        apply_badnet: bool = False,
+        *,
+        trigger: Optional[str] = None,
+        trigger_token_ids: Optional[Sequence[int]] = None,
+        poison_seed: Optional[int] = None,
+    ) -> ClientDatasetBundle:
         if partition_id < 0 or partition_id >= self.config.num_clients:
             raise ValueError(
                 f"partition_id={partition_id} is invalid for num_clients={self.config.num_clients}."
@@ -277,6 +340,16 @@ class MixFedMoEDataManager:
             raise RuntimeError(
                 f"Client partition {partition_id} has {len(partition)} sample(s); requires at least 1."
             )
+        if (
+            self.config.iid_malicious_client_data
+            and partition_id in self.config.malicious_clients
+        ):
+            full_train_split, _ = self._load_full_splits()
+            partition = _sample_iid_like_partition(
+                source_dataset=full_train_split,
+                num_examples=len(partition),
+                seed=self.config.seed + partition_id,
+            )
 
         num_poisoned_examples = 0
         if apply_badnet:
@@ -286,14 +359,37 @@ class MixFedMoEDataManager:
                     f"--target_label={self.config.target_label} is invalid for dataset "
                     f"'{self.config.dataset_name}' with {label_info.num_labels} labels."
                 )
-            partition, num_poisoned_examples = poison_text_classification_dataset(
-                dataset=partition,
-                poison_rate=self.config.poison_rate,
-                target_label=self.config.target_label,
-                trigger=self.config.trigger,
-                seed=self.config.seed + partition_id,
-                trigger_token_ids=self.config.trigger_token_ids,
+            effective_trigger = self.config.trigger if trigger is None else trigger
+            effective_seed = (
+                self.config.seed + partition_id if poison_seed is None else poison_seed
             )
+            effective_trigger_ids = (
+                self.config.trigger_token_ids
+                if trigger_token_ids is None
+                else trigger_token_ids
+            )
+            if self.config.global_random_poison_source:
+                full_train_split, _ = self._load_full_splits()
+                partition, num_poisoned_examples = (
+                    build_client_dataset_with_global_random_poison_source(
+                        local_dataset=partition,
+                        source_dataset=full_train_split,
+                        poison_rate=self.config.poison_rate,
+                        target_label=self.config.target_label,
+                        trigger=effective_trigger,
+                        seed=effective_seed,
+                        trigger_token_ids=effective_trigger_ids,
+                    )
+                )
+            else:
+                partition, num_poisoned_examples = poison_text_classification_dataset(
+                    dataset=partition,
+                    poison_rate=self.config.poison_rate,
+                    target_label=self.config.target_label,
+                    trigger=effective_trigger,
+                    seed=effective_seed,
+                    trigger_token_ids=effective_trigger_ids,
+                )
 
         # No client-side local evaluation split: use the full client partition for training.
         tokenized_train = _tokenize_split(
@@ -312,6 +408,38 @@ class MixFedMoEDataManager:
             num_poisoned_examples=num_poisoned_examples,
         )
 
+    def load_triggered_server_test_dataset(
+        self,
+        *,
+        trigger: str,
+        trigger_token_ids: Sequence[int],
+    ) -> Dataset:
+        """Build an ASR dataset for a trigger supplied to the evaluator."""
+
+        label_info = self.get_label_info()
+        if self.config.target_label >= label_info.num_labels:
+            raise ValueError(
+                f"--target_label={self.config.target_label} is invalid for dataset "
+                f"'{self.config.dataset_name}' with {label_info.num_labels} labels."
+            )
+        _, test_split = self._load_full_splits()
+        test_split = test_split.shuffle(seed=self.config.seed)
+        if self.config.test_samples > 0:
+            test_split = test_split.select(
+                range(min(self.config.test_samples, len(test_split)))
+            )
+        triggered = build_triggered_test_dataset(
+            test_split,
+            trigger=trigger,
+            target_label=self.config.target_label,
+            trigger_token_ids=trigger_token_ids,
+        )
+        return _tokenize_split(
+            split=triggered,
+            tokenizer=self.tokenizer,
+            max_length=self.config.max_length,
+        )
+
     def load_server_test_dataset(self) -> ServerDatasetBundle:
         _, test_split = self._load_full_splits()
         test_split = test_split.shuffle(seed=self.config.seed)
@@ -322,7 +450,13 @@ class MixFedMoEDataManager:
             effective_test_samples = len(test_split)
 
         label_info = self.get_label_info()
-        evaluate_asr = self.config.attack_enabled or self.config.monitor_asr
+        # A3FL's adaptive trigger is supplied only after a malicious client has
+        # optimized it.  Avoid constructing a static set from --trigger here;
+        # the evaluator builds the matching set on demand instead.
+        evaluate_asr = (
+            self.config.attack_mode != "a3fl"
+            and (self.config.attack_enabled or self.config.monitor_asr)
+        )
         if evaluate_asr and self.config.target_label >= label_info.num_labels:
             raise ValueError(
                 f"--target_label={self.config.target_label} is invalid for dataset "

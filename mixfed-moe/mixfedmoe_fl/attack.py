@@ -177,12 +177,13 @@ def poison_text_classification_dataset(
 
     def poison_example(example, index: int):
         if index not in poison_set:
+            clean = dict(example)
+            clean["_mixfedmoe_is_poisoned"] = False
             if exact_trigger_ids:
-                clean = dict(example)
                 clean["_mixfedmoe_trigger_ids"] = []
-                return clean
-            return example
+            return clean
         poisoned = dict(example)
+        poisoned["_mixfedmoe_is_poisoned"] = True
         if exact_trigger_ids:
             poisoned["_mixfedmoe_trigger_ids"] = exact_trigger_ids
         else:
@@ -192,6 +193,95 @@ def poison_text_classification_dataset(
 
     poisoned_dataset = dataset.map(poison_example, with_indices=True)
     return poisoned_dataset, len(poison_indices)
+
+
+def build_client_dataset_with_global_random_poison_source(
+    local_dataset: Dataset,
+    source_dataset: Dataset,
+    poison_rate: float,
+    target_label: int,
+    trigger: str,
+    seed: int,
+    trigger_token_ids: Sequence[int] = (),
+) -> Tuple[Dataset, int]:
+    """Replace local rows with randomly sampled poisoned global-train rows."""
+    required_columns = {"text", "label"}
+    for name, dataset in (("local", local_dataset), ("source", source_dataset)):
+        missing = sorted(required_columns.difference(dataset.column_names))
+        if missing:
+            raise ValueError(
+                f"Global random poisoning requires text/label columns in the {name} "
+                f"dataset; missing={missing}."
+            )
+    if not 0.0 <= poison_rate <= 1.0:
+        raise ValueError("poison_rate must be in [0, 1].")
+    if target_label < 0:
+        raise ValueError("target_label must be >= 0.")
+
+    num_poisoned = int(len(local_dataset) * poison_rate)
+    if num_poisoned == 0:
+        return local_dataset, 0
+
+    eligible_source_indices = [
+        index
+        for index, label in enumerate(source_dataset["label"])
+        if int(label) != target_label
+    ]
+    if len(eligible_source_indices) < num_poisoned:
+        raise ValueError(
+            "Not enough non-target global source examples for poisoning: "
+            f"required={num_poisoned}, available={len(eligible_source_indices)}."
+        )
+
+    rng = np.random.default_rng(seed)
+    selected_source_indices = sorted(
+        int(index)
+        for index in rng.choice(
+            eligible_source_indices,
+            size=num_poisoned,
+            replace=False,
+        ).tolist()
+    )
+    poisoned_rows, selected_count = poison_text_classification_dataset(
+        dataset=source_dataset.select(selected_source_indices),
+        poison_rate=1.0,
+        target_label=target_label,
+        trigger=trigger,
+        seed=seed,
+        trigger_token_ids=trigger_token_ids,
+    )
+    if selected_count != num_poisoned:
+        raise RuntimeError(
+            f"Global random poisoning produced {selected_count} rows; "
+            f"expected {num_poisoned}."
+        )
+
+    num_clean = len(local_dataset) - num_poisoned
+    clean_indices = sorted(
+        int(index)
+        for index in rng.choice(
+            len(local_dataset),
+            size=num_clean,
+            replace=False,
+        ).tolist()
+    )
+    clean_rows = local_dataset.select(clean_indices)
+
+    combined_data: Dict[str, List[Any]] = {
+        "text": [str(text) for text in clean_rows["text"]]
+        + [str(text) for text in poisoned_rows["text"]],
+        "label": [int(label) for label in clean_rows["label"]]
+        + [int(label) for label in poisoned_rows["label"]],
+        "_mixfedmoe_is_poisoned": [False for _ in range(num_clean)]
+        + [True for _ in range(num_poisoned)],
+    }
+    if trigger_token_ids:
+        combined_data["_mixfedmoe_trigger_ids"] = [
+            [] for _ in range(num_clean)
+        ] + [list(ids) for ids in poisoned_rows["_mixfedmoe_trigger_ids"]]
+
+    combined = Dataset.from_dict(combined_data).shuffle(seed=seed)
+    return combined, num_poisoned
 
 # Add the training trigger to non-target-class test inputs without changing labels.
 def build_triggered_test_dataset(

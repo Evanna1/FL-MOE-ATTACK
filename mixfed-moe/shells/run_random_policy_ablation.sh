@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Random policy ablation (both IID and Non-IID):
-#   - datasets x K=4 x mode=mix x policy=random x alpha in {0.5, 100}
+#   - datasets x K=4 x mode=mix x policy=random x distribution in {non-iid, iid}
 #
 # Datasets:
 #   20news, agnews(ag_news), emotion
@@ -43,11 +43,11 @@ DATASET_LOCAL_EPOCHS=(
   "emotion:1"
 )
 K=4
-ALPHA_VALUES=(0.5 100)
+DISTRIBUTION_SPECS=("non-iid:0.5" "iid:0.5")
 
 echo "[run] OUTPUT_ROOT=${OUTPUT_ROOT}"
 echo "[run] HF_HUB_OFFLINE=${HF_HUB_OFFLINE}"
-TOTAL_RUNS=$(( ${#DATASET_PAIRS[@]} * ${#ALPHA_VALUES[@]} ))
+TOTAL_RUNS=$(( ${#DATASET_PAIRS[@]} * ${#DISTRIBUTION_SPECS[@]} ))
 echo "[run] starting random policy ablation experiments (total=${TOTAL_RUNS})..."
 
 for ds_pair in "${DATASET_PAIRS[@]}"; do
@@ -63,8 +63,10 @@ for ds_pair in "${DATASET_PAIRS[@]}"; do
     fi
   done
 
-  for alpha in "${ALPHA_VALUES[@]}"; do
-    if [[ "${alpha}" == "100" ]]; then
+  for distribution_spec in "${DISTRIBUTION_SPECS[@]}"; do
+    data_distribution="${distribution_spec%%:*}"
+    alpha="${distribution_spec##*:}"
+    if [[ "${data_distribution}" == "iid" ]]; then
       dist_label="iid"
     else
       dist_label="niid"
@@ -76,7 +78,7 @@ for ds_pair in "${DATASET_PAIRS[@]}"; do
     echo
     echo "=================================================="
     echo "[run] ${run_name}"
-    echo "[run] local_epochs=${ds_local_epochs}, alpha=${alpha}"
+    echo "[run] local_epochs=${ds_local_epochs}, distribution=${data_distribution}, alpha=${alpha}"
     echo "=================================================="
 
     python -m mixfedmoe_fl.run_simulation \
@@ -85,6 +87,7 @@ for ds_pair in "${DATASET_PAIRS[@]}"; do
       --mode "mix" \
       --K "${K}" \
       --assignment_policy "random" \
+      --data_distribution "${data_distribution}" \
       --alpha "${alpha}" \
       --local_epochs "${ds_local_epochs}" \
       --output_dir "${out_dir}"

@@ -88,6 +88,7 @@ for ds_pair in "${DATASET_PAIRS[@]}"; do
       --mode "${K_ABLATION_MODE}" \
       --K "${k}" \
       --assignment_policy "hot" \
+      --data_distribution "non-iid" \
       --alpha "${ALPHA}" \
       --local_epochs "${ds_local_epochs}" \
       --output_dir "${out_dir}"

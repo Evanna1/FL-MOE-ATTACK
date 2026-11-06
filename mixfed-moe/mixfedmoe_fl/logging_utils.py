@@ -14,12 +14,43 @@ from typing import Any, Dict, Iterator, TextIO
 from mixfedmoe_fl.config import MixFedMoEConfig
 
 
+UPDATE_DIAGNOSTIC_COLUMNS = [
+    f"{group}_{metric}"
+    for group in ("target_expert", "target_router", "shared")
+    for metric in (
+        "local_update_l2",
+        "local_relative_update_l2",
+        "global_update_l2",
+        "global_relative_update_l2",
+        "update_norm_retention",
+        "aggregation_retention",
+        "update_cosine",
+        "contributors",
+    )
+]
+UPDATE_DIAGNOSTIC_COLUMNS.extend(
+    [
+        "num_malicious_target_updates",
+        "target_router_num_malicious_updates",
+        "shared_num_malicious_updates",
+    ]
+)
+
+
 ROUND_CSV_COLUMNS = [
     "round",
     "eval_loss",
     "eval_accuracy",
     "clean_accuracy",
     "asr",
+    "local_asr_pre",
+    "local_asr_post",
+    "local_asr_gain",
+    "local_global_asr_gap",
+    "local_asr_aggregation_retention",
+    "local_asr_eval_examples",
+    "local_asr_num_clients",
+    *UPDATE_DIAGNOSTIC_COLUMNS,
     "trigger_target_probability",
     "trigger_target_hit_rate",
     "trigger_target_execution_rate",
@@ -42,6 +73,12 @@ ATTACK_CSV_COLUMNS = [
     "round",
     "clean_accuracy",
     "asr",
+    "local_asr_pre",
+    "local_asr_post",
+    "local_asr_gain",
+    "local_global_asr_gap",
+    "local_asr_aggregation_retention",
+    *UPDATE_DIAGNOSTIC_COLUMNS,
     "trigger_target_probability",
     "trigger_target_hit_rate",
     "trigger_target_execution_rate",
@@ -56,6 +93,25 @@ BENIGN_LFE_ACTIVATION_COLUMNS = [
     "activation_count",
     "valid_tokens",
     "activation_rate",
+]
+
+POISON_GRADIENT_FLOW_COLUMNS = [
+    "round",
+    "client_id",
+    "target_layer",
+    "target_expert",
+    "clean_examples",
+    "poison_examples",
+    "clean_ce_loss",
+    "poison_ce_loss",
+    "group",
+    "poison_grad_l2",
+    "clean_grad_l2",
+    "poison_energy_ratio",
+    "clean_energy_ratio",
+    "clean_poison_cosine",
+    "poison_to_clean_norm_ratio",
+    "coordinates",
 ]
 
 
@@ -231,6 +287,54 @@ def append_benign_lfe_activation_rows(output_dir: str, rows: list[Dict[str, Any]
     return path
 
 
+def append_poison_gradient_flow_reports(
+    output_dir: str,
+    reports: list[Dict[str, Any]],
+) -> tuple[str, str]:
+    """Append per-client poison-gradient diagnostics as JSONL and long-form CSV."""
+
+    os.makedirs(output_dir, exist_ok=True)
+    jsonl_path = os.path.join(output_dir, "poison_gradient_flow.jsonl")
+    with open(jsonl_path, "a", encoding="utf-8") as handle:
+        for report in reports:
+            handle.write(json.dumps(report, sort_keys=True) + "\n")
+
+    csv_path = os.path.join(output_dir, "poison_gradient_flow.csv")
+    needs_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=POISON_GRADIENT_FLOW_COLUMNS)
+        if needs_header:
+            writer.writeheader()
+        for report in reports:
+            groups = report.get("groups", {})
+            if not isinstance(groups, dict):
+                raise ValueError("Poison-gradient report groups must be an object.")
+            for group_name, group_metrics in groups.items():
+                if not isinstance(group_metrics, dict):
+                    raise ValueError(
+                        f"Poison-gradient group '{group_name}' must be an object."
+                    )
+                row = {
+                    "round": report.get("round", ""),
+                    "client_id": report.get("client_id", ""),
+                    "target_layer": report.get("target_layer", ""),
+                    "target_expert": report.get("target_expert", ""),
+                    "clean_examples": report.get("clean_examples", ""),
+                    "poison_examples": report.get("poison_examples", ""),
+                    "clean_ce_loss": report.get("clean_ce_loss", ""),
+                    "poison_ce_loss": report.get("poison_ce_loss", ""),
+                    "group": group_name,
+                    **group_metrics,
+                }
+                writer.writerow(
+                    {
+                        key: row.get(key, "")
+                        for key in POISON_GRADIENT_FLOW_COLUMNS
+                    }
+                )
+    return jsonl_path, csv_path
+
+
 def append_expert_assignment_log(
     output_dir: str,
     server_round: int,
@@ -257,6 +361,25 @@ def append_expert_assignment_log(
         layers[layer_id] = {"coverage": coverage, "per_client": per_client}
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"round": int(server_round), "layers": layers}, sort_keys=True) + "\n")
+    return path
+
+
+def append_expert_probe_reports(output_dir: str, rows: list[Dict[str, Any]]) -> str:
+    """Append centrally collected malicious-client probe diagnostics."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "expert_probe.jsonl")
+    with open(path, "a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    return path
+
+
+def write_expert_probe_discovery(output_dir: str, discovery: Dict[str, Any]) -> str:
+    """Persist the terminal low-frequency-expert discovery as a concise JSON file."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "expert_probe_discovery.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(discovery, handle, indent=2, sort_keys=True)
     return path
 
 

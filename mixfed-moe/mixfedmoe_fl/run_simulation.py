@@ -8,7 +8,7 @@ from typing import Optional
 from flwr.client import Client
 from flwr.clientapp import ClientApp
 from flwr.common import Context
-from flwr.server import ServerAppComponents, ServerConfig
+from flwr.server import ServerAppComponents, ServerConfig, SimpleClientManager
 from flwr.serverapp import ServerApp
 from flwr.simulation import run_simulation
 
@@ -21,7 +21,11 @@ from mixfedmoe_fl.logging_utils import (
     tee_output_to_log,
     write_run_config,
 )
-from mixfedmoe_fl.server import build_initial_parameters, make_central_evaluate_fn
+from mixfedmoe_fl.server import (
+    ExpertProbeEarlyStoppingServer,
+    build_initial_parameters,
+    make_central_evaluate_fn,
+)
 from mixfedmoe_fl.strategy import MixFedMoEStrategy
 
 _CLIENT_DATA_MANAGER: Optional[MixFedMoEDataManager] = None
@@ -105,7 +109,10 @@ def _build_server_app(runtime_config: MixFedMoEConfig) -> ServerApp:
     def server_fn(context: Context) -> ServerAppComponents:
         _ = context
         return ServerAppComponents(
-            strategy=strategy,
+            server=ExpertProbeEarlyStoppingServer(
+                client_manager=SimpleClientManager(),
+                strategy=strategy,
+            ),
             config=ServerConfig(num_rounds=runtime_config.num_rounds),
         )
 

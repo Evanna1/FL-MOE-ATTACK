@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
+import timeit
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from flwr.common import NDArrays, Parameters, Scalar, ndarrays_to_parameters
+from flwr.common.logger import log
+from flwr.server import History, Server
 from torch.utils.data import DataLoader
 from transformers import DataCollatorWithPadding
 
@@ -12,10 +16,90 @@ from mixfedmoe_fl.attack import load_attack_checkpoint
 from mixfedmoe_fl.client import _load_from_numpy_ndarrays, _state_dict_names, collect_moe_handles
 from mixfedmoe_fl.config import MixFedMoEConfig
 from mixfedmoe_fl.data import MixFedMoEDataManager
-from mixfedmoe_fl.logging_utils import RoundMetricsLogger
+from mixfedmoe_fl.logging_utils import RoundMetricsLogger, UPDATE_DIAGNOSTIC_COLUMNS
 from models.switch_transformers import SwitchTransformersForSequenceClassification
 
 _HF_LOGS_SILENCED = False
+
+
+class ExpertProbeEarlyStoppingServer(Server):
+    """Flower server that exits cleanly once the strategy finds a target expert."""
+
+    def fit(self, num_rounds: int, timeout: float | None) -> tuple[History, float]:
+        history = History()
+
+        log(logging.INFO, "[INIT]")
+        self.parameters = self._get_initial_parameters(server_round=0, timeout=timeout)
+        log(logging.INFO, "Starting evaluation of initial global parameters")
+        initial_evaluation = self.strategy.evaluate(0, parameters=self.parameters)
+        if initial_evaluation is not None:
+            loss, metrics = initial_evaluation
+            history.add_loss_centralized(server_round=0, loss=loss)
+            history.add_metrics_centralized(server_round=0, metrics=metrics)
+
+        start_time = timeit.default_timer()
+        for current_round in range(1, num_rounds + 1):
+            log(logging.INFO, "")
+            log(logging.INFO, "[ROUND %s]", current_round)
+            fit_result = self.fit_round(
+                server_round=current_round,
+                timeout=timeout,
+            )
+            if fit_result is not None:
+                parameters_prime, fit_metrics, _ = fit_result
+                if parameters_prime:
+                    self.parameters = parameters_prime
+                history.add_metrics_distributed_fit(
+                    server_round=current_round,
+                    metrics=fit_metrics,
+                )
+
+            if bool(
+                getattr(self.strategy, "expert_probe_stop_requested", False)
+            ):
+                found = getattr(
+                    self.strategy,
+                    "found_low_frequency_expert",
+                    None,
+                )
+                expert = found.get("expert", "unknown") if found else "unknown"
+                log(
+                    logging.INFO,
+                    "Expert probe found %s in round %s; stopping before the next round.",
+                    expert,
+                    current_round,
+                )
+                break
+
+            centralized = self.strategy.evaluate(
+                current_round,
+                parameters=self.parameters,
+            )
+            if centralized is not None:
+                loss, metrics = centralized
+                history.add_loss_centralized(server_round=current_round, loss=loss)
+                history.add_metrics_centralized(
+                    server_round=current_round,
+                    metrics=metrics,
+                )
+
+            distributed = self.evaluate_round(
+                server_round=current_round,
+                timeout=timeout,
+            )
+            if distributed is not None:
+                loss, metrics, _ = distributed
+                if loss is not None:
+                    history.add_loss_distributed(
+                        server_round=current_round,
+                        loss=loss,
+                    )
+                    history.add_metrics_distributed(
+                        server_round=current_round,
+                        metrics=metrics,
+                    )
+
+        return history, timeit.default_timer() - start_time
 
 
 def _resolve_target_router(model, layer_id: str):
@@ -268,12 +352,39 @@ def make_central_evaluate_fn(
             # Flower also invokes centralized evaluation for round 0. Monitoring is
             # intentionally limited to models produced by a completed benign round.
             evaluate_asr = _should_evaluate_asr(runtime_config, server_round)
+            triggered_dataset = test_bundle.triggered_test_dataset if evaluate_asr else None
+            if (
+                evaluate_asr
+                and runtime_config.attack_mode == "a3fl"
+                and "a3fl_eval_trigger_token_ids_json" in eval_config
+            ):
+                raw_trigger_ids = json.loads(
+                    str(eval_config["a3fl_eval_trigger_token_ids_json"])
+                )
+                if not isinstance(raw_trigger_ids, list) or not raw_trigger_ids:
+                    raise ValueError("Evaluator received an invalid A3FL trigger.")
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in raw_trigger_ids
+                ):
+                    raise ValueError("Evaluator received invalid A3FL trigger token IDs.")
+                trigger_ids = tuple(int(value) for value in raw_trigger_ids)
+                trigger_text = str(
+                    eval_config.get(
+                        "a3fl_eval_trigger_text",
+                        data_manager.tokenizer.decode(
+                            list(trigger_ids),
+                            skip_special_tokens=True,
+                            clean_up_tokenization_spaces=False,
+                        ).strip(),
+                    )
+                )
+                triggered_dataset = data_manager.load_triggered_server_test_dataset(
+                    trigger=trigger_text,
+                    trigger_token_ids=trigger_ids,
+                )
             triggered_loader = _make_eval_loader(
-                dataset=(
-                    test_bundle.triggered_test_dataset
-                    if evaluate_asr
-                    else None
-                ),
+                dataset=triggered_dataset,
                 batch_size=runtime_config.eval_batch_size,
                 collator=collator,
             )
@@ -312,7 +423,8 @@ def make_central_evaluate_fn(
                 target_predictions = 0
                 routing_tracker: Optional[_NaturalTriggerRoutingTracker] = None
                 if (
-                    runtime_config.lfe_target_layer is not None
+                    runtime_config.attack_mode != "a3fl"
+                    and runtime_config.lfe_target_layer is not None
                     and runtime_config.lfe_target_expert is not None
                     and runtime_config.trigger_token_ids
                 ):
@@ -327,7 +439,11 @@ def make_central_evaluate_fn(
                         runtime_config.trigger_token_ids,
                         decoder=runtime_config.lfe_target_layer.startswith("decoder."),
                     )
-                elif runtime_config.lfe_target_layer is not None and runtime_config.lfe_target_expert is not None:
+                elif (
+                    runtime_config.attack_mode != "a3fl"
+                    and runtime_config.lfe_target_layer is not None
+                    and runtime_config.lfe_target_expert is not None
+                ):
                     print(
                         f"[MixFedMoE][round={server_round}] Trigger routing metrics unavailable: "
                         "trigger_token_ids is empty. Regenerate selected_triggers.json with the current "
@@ -362,8 +478,12 @@ def make_central_evaluate_fn(
                 "clean_accuracy": eval_accuracy,
                 "effective_test_samples": int(test_bundle.effective_test_samples),
                 "mode": runtime_config.mode,
-                "attack_enabled": bool(runtime_config.attack_enabled),
-                "monitor_asr": bool(runtime_config.monitor_asr),
+                "attack_enabled": bool(
+                    eval_config.get("attack_enabled", runtime_config.attack_enabled)
+                ),
+                "monitor_asr": bool(
+                    eval_config.get("monitor_asr", runtime_config.monitor_asr)
+                ),
             }
             if attack_success_rate is not None:
                 metrics["asr"] = attack_success_rate
@@ -371,6 +491,17 @@ def make_central_evaluate_fn(
                 metrics.update(trigger_routing_metrics)
             for key, value in eval_config.items():
                 metrics[key] = value
+            if attack_success_rate is not None and "local_asr_post" in metrics:
+                local_pre = float(metrics.get("local_asr_pre", 0.0))
+                local_post = float(metrics["local_asr_post"])
+                metrics["local_global_asr_gap"] = float(
+                    local_post - attack_success_rate
+                )
+                local_gain = local_post - local_pre
+                if abs(local_gain) > 1e-12:
+                    metrics["local_asr_aggregation_retention"] = float(
+                        (attack_success_rate - local_pre) / local_gain
+                    )
 
             log_row = {
                 "round": int(server_round),
@@ -378,6 +509,21 @@ def make_central_evaluate_fn(
                 "eval_accuracy": eval_accuracy,
                 "clean_accuracy": eval_accuracy,
                 "asr": attack_success_rate if attack_success_rate is not None else "",
+                "local_asr_pre": metrics.get("local_asr_pre", ""),
+                "local_asr_post": metrics.get("local_asr_post", ""),
+                "local_asr_gain": metrics.get("local_asr_gain", ""),
+                "local_global_asr_gap": metrics.get("local_global_asr_gap", ""),
+                "local_asr_aggregation_retention": metrics.get(
+                    "local_asr_aggregation_retention", ""
+                ),
+                "local_asr_eval_examples": metrics.get("local_asr_eval_examples", ""),
+                "local_asr_num_clients": metrics.get("local_asr_num_clients", ""),
+                # Kept in JSONL (not the compact CSV) so multi-attacker runs
+                # retain each client's individual pre/post measurement.
+                "local_asr_clients_json": metrics.get("local_asr_clients_json", ""),
+                "parameter_update_diagnostics_json": metrics.get(
+                    "parameter_update_diagnostics_json", ""
+                ),
                 "trigger_target_probability": (
                     trigger_routing_metrics["trigger_target_probability"]
                     if trigger_routing_metrics is not None
@@ -408,9 +554,15 @@ def make_central_evaluate_fn(
                 "benign_lfe_valid_tokens": metrics.get("benign_lfe_valid_tokens", ""),
                 "num_benign_clients_profiled": metrics.get("num_benign_clients_profiled", ""),
                 "mode": runtime_config.mode,
-                "attack_enabled": bool(runtime_config.attack_enabled),
-                "monitor_asr": bool(runtime_config.monitor_asr),
+                "attack_enabled": bool(
+                    metrics.get("attack_enabled", runtime_config.attack_enabled)
+                ),
+                "monitor_asr": bool(
+                    metrics.get("monitor_asr", runtime_config.monitor_asr)
+                ),
             }
+            for diagnostic_key in UPDATE_DIAGNOSTIC_COLUMNS:
+                log_row[diagnostic_key] = metrics.get(diagnostic_key, "")
             metrics_logger.log_round(log_row)
             if attack_success_rate is None:
                 print(
@@ -427,7 +579,14 @@ def make_central_evaluate_fn(
                     )
                 print(
                     f"[MixFedMoE][round={server_round}] "
-                    f"Clean Accuracy={eval_accuracy:.6f} ASR={attack_success_rate:.6f}{routing}",
+                    f"Clean Accuracy={eval_accuracy:.6f} ASR={attack_success_rate:.6f}{routing}"
+                    + (
+                        f" LocalASRPre={float(metrics['local_asr_pre']):.6f}"
+                        f" LocalASRPost={float(metrics['local_asr_post']):.6f}"
+                        f" LocalGlobalGap={float(metrics['local_global_asr_gap']):.6f}"
+                        if "local_asr_post" in metrics
+                        else ""
+                    ),
                     flush=True,
                 )
             return eval_loss, metrics

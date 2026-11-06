@@ -10,6 +10,7 @@ from flwr.common import RecordDict, ndarrays_to_parameters, parameters_to_ndarra
 from mixfedmoe_fl.client import (
     _apply_neurotoxin_gradient_mask,
     _attach_global_update_to_parameter_grads,
+    _build_low_global_update_masks,
     _build_neurotoxin_mask_from_global_update,
     _project_neurotoxin_update,
     _restore_neurotoxin_blocked_values,
@@ -51,6 +52,37 @@ def test_per_tensor_mask_keeps_bottom_fraction_in_each_tensor() -> None:
     assert masks["weight"].sum().item() == 4
     assert masks["bias"].sum().item() == 1
     assert masks["bias"].tolist() == [False, True]
+
+
+def test_poison_nontarget_mask_uses_one_global_low_update_pool() -> None:
+    first = torch.nn.Parameter(torch.zeros(4))
+    second = torch.nn.Parameter(torch.zeros(2))
+    first.grad = torch.tensor([4.0, 1.0, 3.0, 2.0])
+    second.grad = torch.tensor([0.1, 0.2])
+
+    masks = _build_low_global_update_masks(
+        [("first", first), ("second", second)],
+        keep_ratio=0.5,
+    )
+
+    assert masks["first"].tolist() == [False, True, False, False]
+    assert masks["second"].tolist() == [True, True]
+    assert sum(mask.sum().item() for mask in masks.values()) == 3
+
+
+def test_poison_nontarget_ratio_one_keeps_every_coordinate() -> None:
+    first = torch.nn.Parameter(torch.zeros(4))
+    second = torch.nn.Parameter(torch.zeros(2))
+    first.grad = torch.tensor([4.0, 1.0, 3.0, 2.0])
+    second.grad = torch.tensor([0.1, 0.2])
+
+    masks = _build_low_global_update_masks(
+        [("first", first), ("second", second)],
+        keep_ratio=1.0,
+    )
+
+    assert masks["first"].all()
+    assert masks["second"].all()
 
 
 def test_unrouted_parameter_without_gradient_is_treated_as_benign_quiet() -> None:

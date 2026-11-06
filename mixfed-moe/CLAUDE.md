@@ -33,10 +33,11 @@ bash shells/run_ablation_experiments.sh
 |----------|-------------|
 | `--mode` | Client mode: full, mix, drop |
 | `--dataset_name` | Dataset: ag_news, imdb, 20news, sst2, yelp_polarity, emotion |
+| `--data_distribution` | Client partitioning: iid or non-iid (default) |
 | `--num_clients` | Number of FL clients |
 | `--num_rounds` | Federation rounds |
 | `--K` | Experts assigned per client |
-| `--alpha` | Deprecated compatibility option (ignored by IID partitioning) |
+| `--alpha` | Dirichlet concentration for non-iid partitioning (smaller = more skewed) |
 | `--assignment_policy` | Expert assignment: hot (activation-based) or random |
 | `--test_samples` | Max test samples for evaluation (0 = full) |
 
@@ -63,7 +64,7 @@ pytest tests/ -v -m integration
 ```
 mixfedmoe_fl/
 ├── config.py          # CLI argument parsing and MixFedMoEConfig dataclass
-├── data.py            # Dataset loading, tokenization, Dirichlet partitioning
+├── data.py            # Dataset loading, tokenization, IID/Dirichlet partitioning
 ├── client.py          # MixFedMoEClient - local training with full/mix/drop modes
 ├── strategy.py        # MixFedMoEStrategy(FedAvg) - expert assignment & sparse aggregation
 ├── server.py          # Server setup, initial parameters, centralized evaluation
