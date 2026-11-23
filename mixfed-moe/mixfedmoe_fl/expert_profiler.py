@@ -15,7 +15,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# Accumulate padding-aware, pre-capacity Top-1 routing during training.
+from mixfedmoe_fl.model_factory import DECODER_ONLY_MOE_BACKENDS
+
+# Accumulate padding-aware, pre-capacity Top-K routing during training.
 class TrainingLFERoutingTracker:
 
     def __init__(
@@ -23,19 +25,36 @@ class TrainingLFERoutingTracker:
         moe_handles: Sequence[Any],
         top_k: int,
         expert_id_maps: Optional[Dict[str, Sequence[int]]] = None,
+        allow_empty: bool = False,
     ) -> None:
         self.top_k = int(top_k)
+        self.allow_empty = bool(allow_empty)
         self.layer_stats: Dict[str, Dict[str, Any]] = {}
         self.active_masks: Dict[str, torch.Tensor] = {}
         self.hooks: List[Any] = []
         self.num_batches = 0
         self.num_examples = 0
+        self.batch_generation = 0
+        self.layer_generation: Dict[str, int] = {}
 
         for handle in moe_handles:
-            router = getattr(getattr(handle.mlp_module, "router"), "classifier")
-            if not isinstance(router, nn.Linear):
-                raise RuntimeError(f"Expected a linear router classifier at layer '{handle.layer_id}'.")
-            num_experts = int(router.out_features)
+            backend = str(getattr(handle, "backend", "switch"))
+            if backend in DECODER_ONLY_MOE_BACKENDS:
+                router = getattr(handle, "router_module", None)
+                num_experts = int(getattr(handle, "num_experts"))
+                routing_top_k = int(getattr(handle, "router_top_k"))
+                mask_key = "causal"
+            else:
+                router = getattr(getattr(handle.mlp_module, "router"), "classifier")
+                if not isinstance(router, nn.Linear):
+                    raise RuntimeError(
+                        f"Expected a linear router classifier at layer '{handle.layer_id}'."
+                    )
+                num_experts = int(router.out_features)
+                routing_top_k = 1
+                mask_key = handle.stack_name
+            if not isinstance(router, nn.Module):
+                raise RuntimeError(f"Missing router module at layer '{handle.layer_id}'.")
             expert_ids = list(
                 expert_id_maps.get(handle.layer_id, range(num_experts))
                 if expert_id_maps is not None
@@ -48,21 +67,45 @@ class TrainingLFERoutingTracker:
                 )
             self.layer_stats[handle.layer_id] = {
                 "stack": handle.stack_name,
+                "backend": backend,
+                "mask_key": mask_key,
+                "routing_top_k": routing_top_k,
                 "expert_ids": [int(value) for value in expert_ids],
                 "counts": [0 for _ in range(num_experts)],
                 "probability_sums": [0.0 for _ in range(num_experts)],
                 "margin_sums": [0.0 for _ in range(num_experts)],
+                "valid_tokens": 0,
             }
             self.hooks.append(
-                router.register_forward_hook(self._make_hook(handle.layer_id, handle.stack_name))
+                router.register_forward_hook(
+                    self._make_hook(
+                        handle.layer_id,
+                        mask_key,
+                        routing_top_k,
+                        output_is_probabilities=backend == "olmoe",
+                    )
+                )
             )
 
-    def _make_hook(self, layer_id: str, stack_name: str):
-        def hook(_module: nn.Module, _inputs: Any, output: torch.Tensor) -> None:
-            if stack_name not in self.active_masks:
-                raise RuntimeError(f"No active-token mask set for {stack_name} router '{layer_id}'.")
-            logits = output.detach().float().reshape(-1, output.shape[-1])
-            mask = self.active_masks[stack_name].reshape(-1)
+    def _make_hook(
+        self,
+        layer_id: str,
+        mask_key: str,
+        routing_top_k: int,
+        output_is_probabilities: bool,
+    ):
+        def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
+            if mask_key not in self.active_masks:
+                raise RuntimeError(f"No active-token mask set for {mask_key} router '{layer_id}'.")
+            # Gradient checkpointing recomputes the layer during backward and
+            # therefore invokes forward hooks a second time.  Keep exactly one
+            # routing observation per layer and training batch.
+            if self.layer_generation.get(layer_id) == self.batch_generation:
+                return
+            self.layer_generation[layer_id] = self.batch_generation
+            raw_logits = output[0] if isinstance(output, tuple) else output
+            logits = raw_logits.detach().float().reshape(-1, raw_logits.shape[-1])
+            mask = self.active_masks[mask_key].reshape(-1)
             if logits.shape[0] != mask.numel():
                 raise RuntimeError(
                     f"Router/mask size mismatch at {layer_id}: "
@@ -71,39 +114,79 @@ class TrainingLFERoutingTracker:
             valid_logits = logits[mask]
             if valid_logits.numel() == 0:
                 return
-            probabilities = torch.softmax(valid_logits, dim=-1)
-            top_n = min(2, probabilities.shape[-1])
+            # Switch exposes linear logits, whereas the current Transformers
+            # OLMoE router returns its normalized probabilities as tuple item 0.
+            probabilities = (
+                valid_logits
+                if output_is_probabilities
+                else torch.softmax(valid_logits, dim=-1)
+            )
+            selected_k = min(routing_top_k, probabilities.shape[-1])
+            top_n = min(selected_k + 1, probabilities.shape[-1])
             top_values, top_indices = torch.topk(probabilities, k=top_n, dim=-1)
-            selected = top_indices[:, 0]
-            margins = top_values[:, 0] - top_values[:, 1] if top_n == 2 else top_values[:, 0]
+            selected = top_indices[:, :selected_k]
+            selected_values = top_values[:, :selected_k]
+            if top_n > selected_k:
+                boundary = top_values[:, selected_k : selected_k + 1]
+            else:
+                boundary = torch.zeros_like(selected_values[:, :1])
+            margins = selected_values - boundary
             stats = self.layer_stats[layer_id]
+            stats["valid_tokens"] += int(valid_logits.shape[0])
             for expert_idx in range(valid_logits.shape[-1]):
                 expert_mask = selected.eq(expert_idx)
                 count = int(expert_mask.sum().item())
                 stats["counts"][expert_idx] += count
                 if count:
                     stats["probability_sums"][expert_idx] += float(
-                        top_values[expert_mask, 0].sum().item()
+                        selected_values[expert_mask].sum().item()
                     )
-                    stats["margin_sums"][expert_idx] += float(margins[expert_mask].sum().item())
+                    stats["margin_sums"][expert_idx] += float(
+                        margins[expert_mask].sum().item()
+                    )
 
         return hook
 
-    def begin_batch(self, attention_mask: torch.Tensor) -> None:
+    def begin_batch(
+        self,
+        attention_mask: torch.Tensor,
+        example_mask: Optional[torch.Tensor] = None,
+    ) -> None:
         """Set masks for the next model forward and count the observed batch."""
+        self.batch_generation += 1
         encoder_mask = attention_mask.detach().bool()
+        if encoder_mask.ndim != 2:
+            raise ValueError("attention_mask must have shape [batch, sequence].")
+        selected_examples = torch.ones(
+            encoder_mask.shape[0], dtype=torch.bool, device=encoder_mask.device
+        )
+        if example_mask is not None:
+            selected_examples = example_mask.detach().to(
+                device=encoder_mask.device, dtype=torch.bool
+            )
+            if selected_examples.ndim != 1 or selected_examples.shape[0] != encoder_mask.shape[0]:
+                raise ValueError("example_mask must have shape [batch].")
+        if not bool(selected_examples.any()) and not self.allow_empty:
+            raise ValueError("example_mask selected no examples.")
+        encoder_mask = encoder_mask & selected_examples.unsqueeze(1)
         decoder_source_mask = encoder_mask.clone()
         last_valid_positions = encoder_mask.sum(dim=1, keepdim=True).long() - 1
-        if torch.any(last_valid_positions < 0):
+        if (
+            bool(selected_examples.any())
+            and torch.any(last_valid_positions[selected_examples] < 0)
+        ):
             raise ValueError("Each training sequence must contain at least one active token.")
-        decoder_source_mask.scatter_(1, last_valid_positions, False)
+        if encoder_mask.shape[1] > 0 and bool(selected_examples.any()):
+            decoder_source_mask.scatter_(1, last_valid_positions.clamp_min(0), False)
         decoder_mask = torch.cat(
             [torch.ones_like(encoder_mask[:, :1]), decoder_source_mask[:, :-1]], dim=1
         )
+        decoder_mask &= selected_examples.unsqueeze(1)
         self.active_masks["encoder"] = encoder_mask
         self.active_masks["decoder"] = decoder_mask
+        self.active_masks["causal"] = encoder_mask
         self.num_batches += 1
-        self.num_examples += int(attention_mask.shape[0])
+        self.num_examples += int(selected_examples.sum().item())
 
     def finish(self) -> Dict[str, Any]:
         self.close()
@@ -111,7 +194,9 @@ class TrainingLFERoutingTracker:
             "profile_source": "training_router_hooks",
             "training_batches": int(self.num_batches),
             "training_examples": int(self.num_examples),
-            "layers": _finalize_layer_stats(self.layer_stats, self.top_k),
+            "layers": _finalize_layer_stats(
+                self.layer_stats, self.top_k, allow_empty=self.allow_empty
+            ),
         }
 
     def close(self) -> None:
@@ -120,14 +205,18 @@ class TrainingLFERoutingTracker:
         self.hooks.clear()
 
 
-def _finalize_layer_stats(layer_stats: Dict[str, Dict[str, Any]], top_k: int) -> Dict[str, Any]:
+def _finalize_layer_stats(
+    layer_stats: Dict[str, Dict[str, Any]],
+    top_k: int,
+    allow_empty: bool = False,
+) -> Dict[str, Any]:
     layers: Dict[str, Any] = {}
     for layer_id, stats in layer_stats.items():
         counts = [int(value) for value in stats["counts"]]
-        total = int(sum(counts))
-        if total <= 0:
+        total = int(stats.get("valid_tokens", sum(counts)))
+        if total <= 0 and not allow_empty:
             raise RuntimeError(f"No valid routed tokens observed at layer '{layer_id}'.")
-        frequencies = [float(count / total) for count in counts]
+        frequencies = [float(count / total) for count in counts] if total > 0 else [0.0 for _ in counts]
         mean_probabilities = [
             float(stats["probability_sums"][idx] / counts[idx]) if counts[idx] else 0.0
             for idx in range(len(counts))
@@ -140,12 +229,14 @@ def _finalize_layer_stats(layer_stats: Dict[str, Dict[str, Any]], top_k: int) ->
         expert_ids = [int(value) for value in stats.get("expert_ids", range(len(counts)))]
         layers[layer_id] = {
             "stack": stats["stack"],
+            "router_top_k": int(stats.get("routing_top_k", 1)),
             "expert_ids": expert_ids,
             "valid_tokens": total,
             "counts": counts,
             "frequencies": frequencies,
             "mean_selected_probability": mean_probabilities,
             "mean_top1_top2_margin": mean_margins,
+            "mean_topk_boundary_margin": mean_margins,
             "top_low_frequency_experts": [
                 expert_ids[idx] for idx in ranking[: min(top_k, len(ranking))]
             ],
@@ -199,7 +290,7 @@ def collect_lfe_routing_profile(
     device: torch.device,
     top_k: int,
 ) -> Dict[str, Any]:
-    """Collect padding-aware, pre-capacity Top-1 router demand using local hooks."""
+    """Collect padding-aware, pre-capacity Top-K router demand using local hooks."""
     sample_count = min(max_samples, len(dataset))
     if sample_count <= 0:
         raise ValueError("LFE calibration dataset must not be empty.")

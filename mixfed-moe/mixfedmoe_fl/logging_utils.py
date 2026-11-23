@@ -54,6 +54,7 @@ ROUND_CSV_COLUMNS = [
     "trigger_target_probability",
     "trigger_target_hit_rate",
     "trigger_target_execution_rate",
+    "trigger_target_joint_hit_rate",
     "trigger_routing_tokens",
     "train_loss",
     "round_time",
@@ -82,6 +83,7 @@ ATTACK_CSV_COLUMNS = [
     "trigger_target_probability",
     "trigger_target_hit_rate",
     "trigger_target_execution_rate",
+    "trigger_target_joint_hit_rate",
     "trigger_routing_tokens",
 ]
 
@@ -124,16 +126,26 @@ class _SharedLogSink:
 
     def write(self, text: str) -> None:
         with self.lock:
+            # Ray/Colorama can retain the temporary tee stream and write an
+            # ANSI reset from an atexit callback after this context manager has
+            # restored stdout and closed the run log.  That late write is not
+            # part of the simulation and must not mask the real ServerApp
+            # traceback with "I/O operation on closed file".
+            if self.handle.closed:
+                return
             self.handle.write(text)
             self.handle.flush()
 
     def flush(self) -> None:
         with self.lock:
+            if self.handle.closed:
+                return
             self.handle.flush()
 
     def close(self) -> None:
         with self.lock:
-            self.handle.close()
+            if not self.handle.closed:
+                self.handle.close()
 
 
 class _TeeStream:

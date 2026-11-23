@@ -19,6 +19,8 @@ SUPPORTED_DATASET_NAME_TO_HF: Dict[str, str] = {
 SUPPORTED_MODES: List[str] = ["full", "mix", "drop", "flex"]
 SUPPORTED_ASSIGNMENT_POLICIES: List[str] = ["hot", "random"]
 SUPPORTED_DATA_DISTRIBUTIONS: List[str] = ["iid", "non-iid"]
+SUPPORTED_MODEL_BACKENDS: List[str] = ["auto", "switch", "olmoe", "granite"]
+SUPPORTED_MODEL_DTYPES: List[str] = ["auto", "float32", "bfloat16", "float16"]
 DEFAULT_BADNET_TRIGGER = "BadMagic"
 # Tokenized with model_ckpt/switch-base-8 and add_special_tokens=False.
 DEFAULT_BADNET_TRIGGER_TOKEN_IDS: Tuple[int, ...] = (3862, 22909, 447)
@@ -58,6 +60,33 @@ class MixFedMoEConfig:
     num_gpus_per_client: float
     output_dir: str
     test_samples: int
+    model_backend: Literal["auto", "switch", "olmoe", "granite"] = "auto"
+    model_dtype: Literal["auto", "float32", "bfloat16", "float16"] = "auto"
+    # Use bitsandbytes 8-bit AdamW for local training.  Keeps params/grads at
+    # full precision and only quantizes the optimizer moments, cutting the
+    # optimizer-state footprint ~4x so large-backbone MoE (e.g. OLMoE top-8,
+    # K>=8) fits on a single 32 GB card.  On by default; the client falls back
+    # to full-precision AdamW when bitsandbytes is missing or the device is CPU.
+    use_8bit_adam: bool = True
+    # When set, the client that physically shares a GPU with the server's
+    # centralized evaluation releases its resident model (and frees GPU memory)
+    # at the end of each fit, then rebuilds it next round.  This time-shares only
+    # the evaluation card so centralized eval can run on GPU; clients on the other
+    # cards keep their model resident so they are not reclaimed on a shared host.
+    release_model_on_eval_card: bool = False
+    # Physical GPU index the server centralized evaluation runs on (driver cuda:0
+    # maps to physical 0 by default).  Used by clients to detect co-location.
+    eval_gpu_index: int = 0
+    # Max global norm for clipping trainable gradients before each optimizer
+    # step (torch.nn.utils.clip_grad_norm_).  Guards against divergence, which
+    # deeper/wider backbones (e.g. Granite 3B) hit under a learning rate that is
+    # still safe for a smaller model.  Set <= 0 to disable clipping.
+    max_grad_norm: float = 1.0
+    # Enable TF32 for FP32 matmuls (torch.set_float32_matmul_precision("high")).
+    # Memory-neutral; speeds up the FP32 trainable experts in mix mode on
+    # Ampere+/Blackwell GPUs at the cost of ~10-bit matmul mantissa.  Keep this
+    # consistent across runs you compare.
+    tf32: bool = True
     data_distribution: Literal["iid", "non-iid"] = "non-iid"
     assignment_policy: Literal["hot", "random"] = "hot"
     coverage_guarantee: bool = True
@@ -78,9 +107,19 @@ class MixFedMoEConfig:
     inject_target_expert: bool = False
     malicious_target_expert_router_only: bool = False
     isolate_poison_gradients_to_target: bool = False
-    target_expert_poison_gradient_goal_ratio: float = 0.25
-    target_expert_poison_gradient_max_gain: float = 3.0
+    target_expert_poison_gradient_goal_ratio: float = 0
+    target_expert_poison_gradient_max_gain: float = 1.0
     target_router_loss_weight: float = 0.1
+    # Whether malicious clients also apply the Granite router load-balancing
+    # (auxiliary) loss during local training. Benign clients always apply it;
+    # on malicious clients it pulls routing toward balance and therefore mildly
+    # opposes the target-router concentration objective, so it can be disabled.
+    router_aux_loss_on_malicious_client: bool = True
+    # Global override for the model's router load-balancing (auxiliary) loss
+    # coefficient. None keeps the checkpoint's own value; 0.0 disables load
+    # balancing entirely for every client and the server, which is the knob for
+    # testing whether routing collapses without it.
+    router_aux_loss_coef: Optional[float] = None
     target_router_margin: float = 2.0
     target_router_kl_weight: float = 0.1
     target_router_full_weight_below: float = 0.5
@@ -91,15 +130,16 @@ class MixFedMoEConfig:
     neurotoxin_aggregate_all_layers: bool = True
     neurotoxin_max_update_norm: float = 0.0
     neurotoxin_update_scale: float = 1.0
-    a3fl_outer_steps: int = 2
-    a3fl_trigger_steps: int = 2
+    a3fl_outer_steps: int = 3
+    a3fl_trigger_steps: int = 3
     a3fl_candidate_batch_size: int = 32
     a3fl_top_k: int = 32
     a3fl_calibration_samples: int = 16
     a3fl_adv_steps: int = 1
-    a3fl_adv_lr: float = 2e-5
+    a3fl_adv_lr: float = 0.01
     a3fl_lambda: float = 0.01
     a3fl_early_stop_asr: float = 0.95
+    a3fl_olmoe_adversarial_scope: str = "shared_router"
     malicious_lr: float = 0.0
     malicious_local_epochs: float = 0.0
     trigger: str = DEFAULT_BADNET_TRIGGER
@@ -107,7 +147,12 @@ class MixFedMoEConfig:
     selected_triggers_path: Optional[str] = None
     lfe_target_layer: Optional[str] = None
     lfe_target_expert: Optional[int] = None
-    checkpoint_interval: int = 5
+    # Full set of target experts to inject into ``lfe_target_layer``.  When a
+    # single expert is used this is a one-tuple and ``lfe_target_expert`` mirrors
+    # its only element; multiple entries request that *all* of them be forced
+    # into the target layer's top-k simultaneously.
+    lfe_target_experts: Tuple[int, ...] = ()
+    checkpoint_interval: int = 1
     checkpoint_rounds: Tuple[int, ...] = ()
     lfe_profile_enabled: bool = False
     lfe_profile_trainings: int = 20
@@ -151,6 +196,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MixFedMoE Flower simulation configuration.")
     parser.add_argument("--mode", type=str, choices=SUPPORTED_MODES, required=True)
     parser.add_argument("--model_name_or_path", type=str, default="model_ckpt/switch-base-8")
+    parser.add_argument(
+        "--model_backend",
+        type=str,
+        choices=SUPPORTED_MODEL_BACKENDS,
+        default="auto",
+        help="Model implementation to use; auto detects Switch Transformers, OLMoE, or Granite-MoE.",
+    )
+    parser.add_argument(
+        "--model_dtype",
+        type=str,
+        choices=SUPPORTED_MODEL_DTYPES,
+        default="auto",
+        help="Checkpoint load dtype. auto uses FP32 for Switch and BF16 for OLMoE/Granite.",
+    )
     parser.add_argument("--dataset_name", type=str, choices=supported_dataset_names(), default="ag_news")
     parser.add_argument(
         "--data_distribution",
@@ -177,6 +236,53 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local_epochs", type=float, default=1.0)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help=(
+            "Clip trainable gradients to this global norm before each optimizer step "
+            "to prevent divergence (<= 0 disables clipping). Default 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable TF32 for FP32 matmuls to speed up mix-mode FP32 experts "
+            "(memory-neutral). On by default; pass --no-tf32 for strict FP32 precision."
+        ),
+    )
+    parser.add_argument(
+        "--use_8bit_adam",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use bitsandbytes 8-bit AdamW for local training to cut optimizer-state "
+            "memory ~4x (requires the 'bitsandbytes' package). On by default; pass "
+            "--no-use_8bit_adam to force full-precision AdamW. Falls back to AdamW "
+            "automatically when bitsandbytes is unavailable or training on CPU."
+        ),
+    )
+    parser.add_argument(
+        "--release_model_on_eval_card",
+        action="store_true",
+        help=(
+            "Only the client sharing the evaluation GPU frees its resident model "
+            "after each fit and rebuilds it next round, so centralized eval can run "
+            "on that card. Clients on other cards keep their model resident."
+        ),
+    )
+    parser.add_argument(
+        "--eval_gpu_index",
+        type=int,
+        default=0,
+        help=(
+            "Physical GPU index the server centralized evaluation uses (default 0). "
+            "Clients on this card release/rebuild when --release_model_on_eval_card is set."
+        ),
+    )
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=256)
@@ -334,8 +440,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Scale the final masked malicious model delta before upload; 1 leaves it unchanged.",
     )
-    parser.add_argument("--a3fl_outer_steps", type=int, default=2)
-    parser.add_argument("--a3fl_trigger_steps", type=int, default=2)
+    parser.add_argument("--a3fl_outer_steps", type=int, default=3)
+    parser.add_argument("--a3fl_trigger_steps", type=int, default=3)
     parser.add_argument("--a3fl_candidate_batch_size", type=int, default=32)
     parser.add_argument("--a3fl_top_k", type=int, default=32)
     parser.add_argument("--a3fl_calibration_samples", type=int, default=16)
@@ -343,8 +449,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--a3fl_adv_lr",
         type=float,
-        default=2e-5,
-        help="Learning rate for the adversarial model that unlearns the current trigger.",
+        default=0.01,
+        help="SGD learning rate (paper alpha_2) for the adversarial model that unlearns the current trigger.",
     )
     parser.add_argument(
         "--a3fl_lambda",
@@ -354,6 +460,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "lambda_0 * cosine_similarity(theta'_t, theta_t).",
     )
     parser.add_argument("--a3fl_early_stop_asr", type=float, default=0.95)
+    parser.add_argument(
+        "--a3fl_olmoe_adversarial_scope",
+        choices=["shared_router", "full"],
+        default="shared_router",
+        help=(
+            "Packed-MoE A3FL adversarial-model scope: shared_router is single-A800 "
+            "friendly; full follows the original all-parameter unlearning step."
+        ),
+    )
     parser.add_argument(
         "--malicious_lr",
         type=float,
@@ -411,7 +526,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target_expert_poison_gradient_goal_ratio",
         type=float,
-        default=0.25,
+        default=0,
         help=(
             "Target share of the masked poison-gradient L2 norm. When the target "
             "expert's EMA share is lower, its gradient is amplified and the complete "
@@ -421,7 +536,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target_expert_poison_gradient_max_gain",
         type=float,
-        default=3.0,
+        default=1.0,
         help="Maximum adaptive pre-normalization gain for target-expert poison gradients.",
     )
     parser.add_argument(
@@ -429,6 +544,28 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Weight of the adaptive trigger-to-target-expert margin objective.",
+    )
+    parser.add_argument(
+        "--disable_router_aux_loss_on_malicious_client",
+        dest="router_aux_loss_on_malicious_client",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not apply the Granite router load-balancing (auxiliary) loss on "
+            "malicious clients. Benign clients always apply it. Use this when the "
+            "balance pull measurably weakens the target-router backdoor."
+        ),
+    )
+    parser.add_argument(
+        "--router_aux_loss_coef",
+        type=float,
+        default=None,
+        help=(
+            "Global override for the model's router load-balancing (auxiliary) "
+            "loss coefficient, applied to every client and the server. Leave unset "
+            "to keep the checkpoint's own value. Pass 0 to disable load balancing "
+            "entirely, e.g. to test whether routing collapses without it."
+        ),
     )
     parser.add_argument(
         "--target_router_margin",
@@ -473,8 +610,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lfe_target_expert",
         type=int,
+        nargs="+",
         default=None,
-        help="Target (cold) expert index for cold-expert injection; overrides --selected_triggers_path.",
+        help="Target (cold) expert index/indices for cold-expert injection. Pass several to "
+        "inject multiple experts into the same layer simultaneously, e.g. "
+        "--lfe_target_expert 19 47. Overrides --selected_triggers_path.",
     )
     parser.add_argument("--trigger", type=str, default=DEFAULT_BADNET_TRIGGER)
     parser.add_argument(
@@ -491,9 +631,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint_interval",
         type=int,
-        default=5,
+        default=1,
         help=(
-            "Save a server checkpoint every N rounds (default: 5); "
+            "Save a server checkpoint every N rounds (default: 1); "
             "set to 0 to disable periodic checkpoints."
         ),
     )
@@ -638,6 +778,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def validate_config(config: MixFedMoEConfig) -> None:
+    if config.model_backend not in SUPPORTED_MODEL_BACKENDS:
+        raise ValueError(
+            f"--model_backend must be one of {SUPPORTED_MODEL_BACKENDS}, "
+            f"got {config.model_backend!r}."
+        )
+    if config.model_dtype not in SUPPORTED_MODEL_DTYPES:
+        raise ValueError(
+            f"--model_dtype must be one of {SUPPORTED_MODEL_DTYPES}, "
+            f"got {config.model_dtype!r}."
+        )
     if config.monitor_asr and config.attack_enabled:
         raise ValueError("--monitor_asr and --attack_enabled are mutually exclusive.")
     if config.measure_local_asr and not config.attack_enabled:
@@ -746,6 +896,10 @@ def validate_config(config: MixFedMoEConfig) -> None:
         raise ValueError("--a3fl_lambda (lambda_0) must be >= 0.")
     if not 0.0 <= config.a3fl_early_stop_asr <= 1.0:
         raise ValueError("--a3fl_early_stop_asr must be in [0, 1].")
+    if config.a3fl_olmoe_adversarial_scope not in {"shared_router", "full"}:
+        raise ValueError(
+            "--a3fl_olmoe_adversarial_scope must be shared_router or full."
+        )
     if config.attack_mode == "a3fl" and config.inject_target_expert:
         raise ValueError("--attack_mode=a3fl is independent of --inject_target_expert.")
     if config.attack_end_round > 0 and config.attack_end_round < config.attack_start_round:
@@ -840,6 +994,20 @@ def validate_config(config: MixFedMoEConfig) -> None:
         raise ValueError("--selected_triggers_path requires --attack_enabled or --monitor_asr.")
     if (config.lfe_target_layer is None) != (config.lfe_target_expert is None):
         raise ValueError("Low-frequency expert target layer and expert must be set together.")
+    if config.lfe_target_experts:
+        if any(expert_id < 0 for expert_id in config.lfe_target_experts):
+            raise ValueError("--lfe_target_expert indices must be non-negative.")
+        if len(set(config.lfe_target_experts)) != len(config.lfe_target_experts):
+            raise ValueError("--lfe_target_expert must not contain duplicate indices.")
+        if config.lfe_target_expert != config.lfe_target_experts[0]:
+            raise ValueError(
+                "Internal error: lfe_target_expert must mirror the first entry of "
+                "lfe_target_experts."
+            )
+    elif config.lfe_target_expert is not None:
+        raise ValueError(
+            "Internal error: lfe_target_expert set without lfe_target_experts."
+        )
     if len(set(config.malicious_clients)) != len(config.malicious_clients):
         raise ValueError("--malicious_clients must not contain duplicates.")
     invalid_clients = [cid for cid in config.malicious_clients if cid < 0 or cid >= config.num_clients]
@@ -883,8 +1051,8 @@ def validate_config(config: MixFedMoEConfig) -> None:
         raise ValueError("--checkpoint_rounds values must be >= 1.")
     if config.lfe_profile_trainings <= 0:
         raise ValueError("--lfe_profile_trainings must be > 0.")
-    if not 1 <= config.lfe_top_k <= 8:
-        raise ValueError("--lfe_top_k must be in [1, 8] for switch-base-8.")
+    if not 1 <= config.lfe_top_k <= 64:
+        raise ValueError("--lfe_top_k must be in [1, 64].")
     if config.lfe_calibration_samples <= 0:
         raise ValueError("--lfe_calibration_samples must be > 0.")
     if config.defense not in SUPPORTED_DEFENSES:
@@ -963,7 +1131,7 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
 
     trigger = args.trigger
     lfe_target_layer: Optional[str] = None
-    lfe_target_expert: Optional[int] = None
+    lfe_target_experts: Tuple[int, ...] = ()
     trigger_token_ids = (
         DEFAULT_BADNET_TRIGGER_TOKEN_IDS if trigger == DEFAULT_BADNET_TRIGGER else ()
     )
@@ -971,17 +1139,53 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
         selected = load_selected_trigger(args.selected_triggers_path)
         trigger = selected.trigger
         lfe_target_layer = selected.target_layer
-        lfe_target_expert = selected.target_expert
+        # Prefer the full expert list carried by target.targets (expert_ids) for
+        # the target layer so multi-expert injection reads every expert; fall
+        # back to the single target.expert_id for legacy files (or older
+        # SelectedTrigger objects without the target_specs field).
+        experts_from_specs = next(
+            (
+                experts
+                for layer_id, experts in getattr(selected, "target_specs", ())
+                if layer_id == selected.target_layer
+            ),
+            (),
+        )
+        if experts_from_specs:
+            ordered_specs: List[int] = []
+            for value in experts_from_specs:
+                expert_id = int(value)
+                if expert_id not in ordered_specs:
+                    ordered_specs.append(expert_id)
+            lfe_target_experts = tuple(ordered_specs)
+        elif selected.target_expert is not None:
+            lfe_target_experts = (int(selected.target_expert),)
         trigger_token_ids = selected.trigger_token_ids
     if args.lfe_target_layer is not None:
         lfe_target_layer = args.lfe_target_layer
     if args.lfe_target_expert is not None:
-        lfe_target_expert = args.lfe_target_expert
+        # argparse hands back a list because of nargs="+"; preserve order while
+        # dropping duplicates so [19, 47, 19] collapses to (19, 47).
+        seen: set[int] = set()
+        ordered: List[int] = []
+        for value in args.lfe_target_expert:
+            expert_id = int(value)
+            if expert_id not in seen:
+                seen.add(expert_id)
+                ordered.append(expert_id)
+        lfe_target_experts = tuple(ordered)
+    # The primary expert mirrors the first element so the many single-expert
+    # diagnostic paths keep working unchanged.
+    lfe_target_expert: Optional[int] = (
+        lfe_target_experts[0] if lfe_target_experts else None
+    )
 
     checkpoint_path = args.checkpoint_path or args.init_checkpoint
     config = MixFedMoEConfig(
         mode=args.mode,
         model_name_or_path=args.model_name_or_path,
+        model_backend=args.model_backend,
+        model_dtype=args.model_dtype,
         dataset_name=args.dataset_name,
         num_clients=args.num_clients,
         num_rounds=args.num_rounds,
@@ -992,6 +1196,11 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
         local_epochs=args.local_epochs,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
+        tf32=args.tf32,
+        use_8bit_adam=args.use_8bit_adam,
+        release_model_on_eval_card=args.release_model_on_eval_card,
+        eval_gpu_index=args.eval_gpu_index,
         train_batch_size=args.train_batch_size,
         eval_batch_size=args.eval_batch_size,
         max_length=args.max_length,
@@ -1030,6 +1239,10 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
             args.target_expert_poison_gradient_max_gain
         ),
         target_router_loss_weight=args.target_router_loss_weight,
+        router_aux_loss_on_malicious_client=(
+            args.router_aux_loss_on_malicious_client
+        ),
+        router_aux_loss_coef=args.router_aux_loss_coef,
         target_router_margin=args.target_router_margin,
         target_router_kl_weight=args.target_router_kl_weight,
         target_router_full_weight_below=args.target_router_full_weight_below,
@@ -1049,6 +1262,7 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
         a3fl_adv_lr=args.a3fl_adv_lr,
         a3fl_lambda=args.a3fl_lambda,
         a3fl_early_stop_asr=args.a3fl_early_stop_asr,
+        a3fl_olmoe_adversarial_scope=args.a3fl_olmoe_adversarial_scope,
         malicious_lr=args.malicious_lr,
         malicious_local_epochs=args.malicious_local_epochs,
         trigger=trigger,
@@ -1056,6 +1270,7 @@ def parse_config(argv: Sequence[str] | None = None) -> MixFedMoEConfig:
         selected_triggers_path=args.selected_triggers_path,
         lfe_target_layer=lfe_target_layer,
         lfe_target_expert=lfe_target_expert,
+        lfe_target_experts=lfe_target_experts,
         checkpoint_interval=args.checkpoint_interval,
         checkpoint_rounds=tuple(sorted(set(args.checkpoint_rounds))),
         lfe_profile_enabled=args.lfe_profile_enabled,

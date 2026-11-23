@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from transformers import AutoConfig
 from flwr.common import (
     EvaluateIns,
     EvaluateRes,
@@ -34,6 +35,17 @@ from mixfedmoe_fl.logging_utils import (
     append_poison_gradient_flow_reports,
     write_expert_probe_discovery,
 )
+from mixfedmoe_fl.olmoe_adapter import (
+    OLMOE_PACKED_EXPERT_PATTERN,
+    OLMOE_ROUTER_WEIGHT_PATTERN,
+    parse_olmoe_expert_slice_name,
+)
+from mixfedmoe_fl.granite_adapter import (
+    GRANITE_PACKED_EXPERT_PATTERN,
+    GRANITE_ROUTER_WEIGHT_PATTERN,
+    parse_granite_expert_slice_name,
+)
+from mixfedmoe_fl.model_factory import DECODER_ONLY_MOE_BACKENDS
 
 LAYER_ID_PATTERN = re.compile(r"^(encoder|decoder)\.(\d+)$")
 EXPERT_PARAM_PATTERN = re.compile(
@@ -395,6 +407,12 @@ class RouterParamMeta:
     kind: str  # weight | bias
 
 
+@dataclass(frozen=True)
+class PackedExpertParamMeta:
+    layer_id: str
+    kind: str  # gate_up_proj | down_proj
+
+
 CentralEvaluateFn = Callable[
     [int, NDArrays, Dict[str, Scalar]],
     tuple[float, Dict[str, Scalar]] | None,
@@ -416,13 +434,55 @@ class MixFedMoEStrategy(FedAvg):
 
         self.param_name_to_idx: Dict[str, int] = {name: i for i, name in enumerate(self.parameter_names)}
         self.expert_param_meta: Dict[int, ExpertParamMeta] = {}
+        self.packed_expert_param_meta: Dict[int, PackedExpertParamMeta] = {}
+        self.packed_expert_param_lookup: Dict[Tuple[str, str], int] = {}
         self.router_param_meta: Dict[int, RouterParamMeta] = {}
         self.expert_name_lookup: Dict[Tuple[str, int, str], str] = {}
+        if any(OLMOE_PACKED_EXPERT_PATTERN.match(name) for name in self.parameter_names):
+            self.model_backend = "olmoe"
+        elif any(GRANITE_PACKED_EXPERT_PATTERN.match(name) for name in self.parameter_names):
+            self.model_backend = "granite"
+        else:
+            self.model_backend = "switch"
+        self.olmoe_router_top_k = 1
+        self.olmoe_num_experts = 0
+        self.granite_router_top_k = 1
+        self.granite_num_experts = 0
+        if self.model_backend == "olmoe":
+            model_config = AutoConfig.from_pretrained(
+                self.runtime_config.model_name_or_path
+            )
+            if str(getattr(model_config, "model_type", "")) != "olmoe":
+                raise ValueError(
+                    "Packed OLMoE parameter names were detected, but the checkpoint "
+                    f"reports model_type={getattr(model_config, 'model_type', None)!r}."
+                )
+            self.olmoe_router_top_k = int(model_config.num_experts_per_tok)
+            self.olmoe_num_experts = int(model_config.num_experts)
+        elif self.model_backend == "granite":
+            model_config = AutoConfig.from_pretrained(self.runtime_config.model_name_or_path)
+            if str(getattr(model_config, "model_type", "")).lower() not in {"granitemoe", "granite_moe"}:
+                raise ValueError("Packed Granite parameter names were detected, but checkpoint config is not Granite-MoE.")
+            self.granite_router_top_k = int(model_config.num_experts_per_tok)
+            self.granite_num_experts = int(model_config.num_local_experts)
         self.layer_num_experts: Dict[str, int] = self._infer_layer_num_experts()
         self.layer_ids: List[str] = sorted(self.layer_num_experts.keys(), key=_layer_sort_key)
 
+        if self.model_backend in DECODER_ONLY_MOE_BACKENDS:
+            if self.runtime_config.mode != "mix":
+                raise ValueError("Packed-expert federation currently supports mode=mix only.")
+            packed_top_k = self.olmoe_router_top_k if self.model_backend == "olmoe" else self.granite_router_top_k
+            if int(self.runtime_config.k) < packed_top_k:
+                raise ValueError(
+                    f"Packed MoE uses Top-{packed_top_k} routing, so --K must be large enough; got {self.runtime_config.k}."
+                )
+            if str(getattr(self.runtime_config, "defense", "none")) != "none":
+                raise ValueError(
+                    "Robust defenses have not yet been generalized to packed OLMoE/Granite expert slices."
+                )
+
         if self.runtime_config.mode == "flex" and self.runtime_config.assignment_policy != "hot":
-            raise ValueError("--mode=flex requires assignment_policy='hot'.")
+            raise ValueError("Flex mode requires assignment_policy='hot'.")
         if self.runtime_config.mode == "flex" and self.runtime_config.k != 1:
             raise ValueError("--mode=flex requires k=1.")
 
@@ -621,7 +681,42 @@ class MixFedMoEStrategy(FedAvg):
 
     def _infer_layer_num_experts(self) -> Dict[str, int]:
         layer_max_expert: Dict[str, int] = {}
+        packed_layers: Dict[str, int] = {}
         for idx, name in enumerate(self.parameter_names):
+            packed_match = OLMOE_PACKED_EXPERT_PATTERN.match(name)
+            granite_packed_match = GRANITE_PACKED_EXPERT_PATTERN.match(name)
+            if packed_match is not None:
+                layer_id = f"decoder.{int(packed_match.group(1))}"
+                kind = packed_match.group(2)
+                self.packed_expert_param_meta[idx] = PackedExpertParamMeta(
+                    layer_id=layer_id,
+                    kind=kind,
+                )
+                self.packed_expert_param_lookup[(layer_id, kind)] = idx
+                packed_layers[layer_id] = self.olmoe_num_experts
+                continue
+            if granite_packed_match is not None:
+                layer_id = f"decoder.{int(granite_packed_match.group(1))}"
+                kind = granite_packed_match.group(2)
+                self.packed_expert_param_meta[idx] = PackedExpertParamMeta(layer_id=layer_id, kind=kind)
+                self.packed_expert_param_lookup[(layer_id, kind)] = idx
+                packed_layers[layer_id] = self.granite_num_experts
+                continue
+
+            olmoe_router_match = OLMOE_ROUTER_WEIGHT_PATTERN.match(name)
+            if olmoe_router_match is not None:
+                layer_id = f"decoder.{int(olmoe_router_match.group(1))}"
+                self.router_param_meta[idx] = RouterParamMeta(
+                    layer_id=layer_id,
+                    kind="weight",
+                )
+                continue
+            granite_router_match = GRANITE_ROUTER_WEIGHT_PATTERN.match(name)
+            if granite_router_match is not None:
+                layer_id = f"decoder.{int(granite_router_match.group(1))}"
+                self.router_param_meta[idx] = RouterParamMeta(layer_id=layer_id, kind="weight")
+                continue
+
             expert_match = EXPERT_PARAM_PATTERN.match(name)
             if expert_match is not None:
                 stack = expert_match.group(1)
@@ -647,7 +742,12 @@ class MixFedMoEStrategy(FedAvg):
                 layer_id = f"{router_bias_match.group(1)}.{int(router_bias_match.group(2))}"
                 self.router_param_meta[idx] = RouterParamMeta(layer_id=layer_id, kind="bias")
 
-        return {layer_id: max_expert + 1 for layer_id, max_expert in layer_max_expert.items()}
+        inferred = {
+            layer_id: max_expert + 1
+            for layer_id, max_expert in layer_max_expert.items()
+        }
+        inferred.update(packed_layers)
+        return inferred
 
     def _parse_assignments_metric(
         self,
@@ -708,6 +808,35 @@ class MixFedMoEStrategy(FedAvg):
                     assignments[cid].append(candidate)
                 candidate = (candidate + 1) % num_experts
             assignments[cid].sort()
+        return assignments
+
+    def _assign_round1_no_coverage(
+        self,
+        sorted_cids: List[str],
+        num_experts: int,
+        k: int,
+    ) -> Dict[str, List[int]]:
+        """Build deterministic, diversified first-round assignments without coverage.
+
+        This path is used only when ``--no_coverage_guarantee`` is explicit.
+        It lets small smoke tests run with fewer than ``ceil(E / K)`` clients,
+        while avoiding the uninformative result where every client receives
+        the same first K experts before activation profiles exist.
+        """
+        assignments: Dict[str, List[int]] = {}
+        for cid_idx, cid in enumerate(sorted_cids):
+            start = (cid_idx * int(k)) % int(num_experts)
+            assignments[cid] = sorted(
+                {
+                    int((start + offset) % int(num_experts))
+                    for offset in range(int(k))
+                }
+            )
+            if len(assignments[cid]) != int(k):
+                raise RuntimeError(
+                    f"Failed to build exact-K first-round assignment for client={cid}: "
+                    f"got {len(assignments[cid])}, want {k}."
+                )
         return assignments
 
     def _assign_by_preferences_with_coverage(
@@ -878,7 +1007,18 @@ class MixFedMoEStrategy(FedAvg):
                         rng=self._assignment_rng(server_round=server_round, layer_id=layer_id),
                     )
                 elif server_round == 1:
-                    layer_assignment = self._assign_round1(sorted_cids=sorted_cids, num_experts=num_experts, k=k)
+                    if policy == "hot" and not self.runtime_config.coverage_guarantee:
+                        layer_assignment = self._assign_round1_no_coverage(
+                            sorted_cids=sorted_cids,
+                            num_experts=num_experts,
+                            k=k,
+                        )
+                    else:
+                        layer_assignment = self._assign_round1(
+                            sorted_cids=sorted_cids,
+                            num_experts=num_experts,
+                            k=k,
+                        )
                 else:
                     if policy == "hot" and not self.runtime_config.coverage_guarantee:
                         layer_assignment = self._assign_roundn_no_coverage(
@@ -937,6 +1077,34 @@ class MixFedMoEStrategy(FedAvg):
 
         sample_size, min_num_clients = self.num_fit_clients(client_manager.num_available())
         sampled_clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num_clients)
+        # The probe state lives on the primary malicious client and is decoded
+        # only when that client returns a fit result.  Random client sampling
+        # can otherwise create silent gaps in ``expert_probe.jsonl`` and leave
+        # the paired-probe state machine waiting for a response that never
+        # arrives.  When probing is enabled, reserve one sampled slot for the
+        # primary probe client whenever Flower's manager exposes ``all()``.
+        if (
+            self.runtime_config.expert_probe_enabled
+            and self.runtime_config.attack_enabled
+            and self.runtime_config.malicious_clients
+        ):
+            probe_cid = str(min(self.runtime_config.malicious_clients))
+            if not any(str(client.cid) == probe_cid for client in sampled_clients):
+                all_clients = getattr(client_manager, "all", None)
+                available = all_clients() if callable(all_clients) else {}
+                probe_client = available.get(probe_cid) if isinstance(available, dict) else None
+                if probe_client is not None and sampled_clients:
+                    replacement_index = next(
+                        (
+                            index
+                            for index, client in enumerate(sampled_clients)
+                            if str(client.cid) not in {
+                                str(value) for value in self.runtime_config.malicious_clients
+                            }
+                        ),
+                        len(sampled_clients) - 1,
+                    )
+                    sampled_clients[replacement_index] = probe_client
         sampled_cids = [client.cid for client in sampled_clients]
 
         per_client_assignments = self._build_assignments_for_clients(server_round=server_round, cids=sampled_cids)
@@ -1022,6 +1190,23 @@ class MixFedMoEStrategy(FedAvg):
         if param_idx not in router_row_sums:
             router_row_sums[param_idx] = np.zeros(target_shape, dtype=np.float32)
             router_row_weights[param_idx] = np.zeros(target_shape[0], dtype=np.float32)
+
+        if (
+            array.shape == target_shape
+            and self.model_backend in DECODER_ONLY_MOE_BACKENDS
+            and mode == "mix"
+        ):
+            if meta.layer_id not in assignments:
+                raise KeyError(
+                    f"Missing assignments for layer={meta.layer_id} while aggregating OLMoE router rows."
+                )
+            for global_expert_idx in assignments[meta.layer_id]:
+                router_row_sums[param_idx][global_expert_idx] += (
+                    array[global_expert_idx].astype(np.float32, copy=False)
+                    * np.float32(weight)
+                )
+                router_row_weights[param_idx][global_expert_idx] += np.float32(weight)
+            return
 
         if array.shape == target_shape:
             router_row_sums[param_idx] += array.astype(np.float32, copy=False) * np.float32(weight)
@@ -1264,6 +1449,8 @@ class MixFedMoEStrategy(FedAvg):
         baseline = self._current_global_arrays
         dense_sums: Dict[int, np.ndarray] = {}
         dense_weights: Dict[int, float] = {}
+        packed_expert_sums: Dict[Tuple[int, int], np.ndarray] = {}
+        packed_expert_weights: Dict[Tuple[int, int], float] = {}
         router_row_sums: Dict[int, np.ndarray] = {}
         router_row_weights: Dict[int, np.ndarray] = {}
         # For robust-aggregation defenses (mix mode): collect per-parameter contributor
@@ -1290,12 +1477,19 @@ class MixFedMoEStrategy(FedAvg):
             and target_layer is not None
             and target_expert is not None
         ):
-            target_expert_selection = {
-                index: None
-                for index, meta in self.expert_param_meta.items()
-                if meta.layer_id == target_layer
-                and meta.expert_idx == int(target_expert)
-            }
+            if self.model_backend in DECODER_ONLY_MOE_BACKENDS:
+                target_expert_selection = {
+                    index: int(target_expert)
+                    for index, meta in self.packed_expert_param_meta.items()
+                    if meta.layer_id == target_layer
+                }
+            else:
+                target_expert_selection = {
+                    index: None
+                    for index, meta in self.expert_param_meta.items()
+                    if meta.layer_id == target_layer
+                    and meta.expert_idx == int(target_expert)
+                }
             target_router_selection = {
                 index: int(target_expert)
                 for index, meta in self.router_param_meta.items()
@@ -1305,6 +1499,7 @@ class MixFedMoEStrategy(FedAvg):
                 index: None
                 for index in range(len(self.parameter_names))
                 if index not in self.expert_param_meta
+                and index not in self.packed_expert_param_meta
                 and index not in self.router_param_meta
             }
             if not target_expert_selection:
@@ -1483,6 +1678,68 @@ class MixFedMoEStrategy(FedAvg):
                     ).copy()
 
             for local_name, array in zip(returned_names, returned_arrays):
+                olmoe_slice = parse_olmoe_expert_slice_name(local_name)
+                granite_slice = parse_granite_expert_slice_name(local_name)
+                packed_slice = olmoe_slice if olmoe_slice is not None else granite_slice
+                if packed_slice is not None:
+                    if self.model_backend not in DECODER_ONLY_MOE_BACKENDS or mode != "mix":
+                        raise ValueError(
+                            f"Client {client_cid} returned a packed-MoE expert slice in "
+                            f"backend={self.model_backend}, mode={mode}."
+                        )
+                    layer_id, expert_idx, kind = packed_slice
+                    if layer_id not in assignments:
+                        raise KeyError(
+                            f"Client {client_cid} has no assignment for packed-MoE layer {layer_id}."
+                        )
+                    if expert_idx not in assignments[layer_id]:
+                        raise ValueError(
+                            f"Client {client_cid} returned unassigned packed-MoE expert "
+                            f"{expert_idx}@{layer_id}."
+                        )
+                    lookup_key = (layer_id, kind)
+                    if lookup_key not in self.packed_expert_param_lookup:
+                        raise KeyError(
+                            f"No global packed tensor for slice {local_name!r}."
+                        )
+                    param_idx = self.packed_expert_param_lookup[lookup_key]
+                    expected_shape = baseline[param_idx][expert_idx].shape
+                    if array.shape != expected_shape:
+                        raise ValueError(
+                            f"Shape mismatch for packed-MoE slice {local_name!r}: "
+                            f"got={array.shape}, expected={expected_shape}."
+                        )
+                    key = (param_idx, expert_idx)
+                    weighted = array.astype(np.float32, copy=False) * np.float32(
+                        num_examples
+                    )
+                    if key not in packed_expert_sums:
+                        packed_expert_sums[key] = weighted.astype(
+                            np.float32, copy=True
+                        )
+                        packed_expert_weights[key] = num_examples
+                    else:
+                        packed_expert_sums[key] += weighted
+                        packed_expert_weights[key] += num_examples
+                    selected_target_row = update_group_selections.get(
+                        "target_expert", {}
+                    ).get(param_idx)
+                    if (
+                        selected_target_row is not None
+                        and int(selected_target_row) == expert_idx
+                    ):
+                        client_diagnostic_groups.add("target_expert")
+                        if captures_malicious_update:
+                            local_full = client_diagnostic_arrays.get(param_idx)
+                            if local_full is None:
+                                local_full = baseline[param_idx].copy()
+                            local_full[expert_idx] = np.asarray(array).astype(
+                                local_full.dtype,
+                                copy=False,
+                            )
+                            client_diagnostic_arrays[param_idx] = local_full
+                    continue
+
                 mapped_name = local_name
                 expert_match = EXPERT_PARAM_PATTERN.match(local_name)
                 if mode == "drop" and expert_match is not None:
@@ -1613,6 +1870,18 @@ class MixFedMoEStrategy(FedAvg):
                         f"Router aggregation failure for '{self.parameter_names[param_idx]}': "
                         f"missing expert rows={missing_rows}."
                     )
+            for param_idx, meta in self.packed_expert_param_meta.items():
+                missing_experts = [
+                    expert_idx
+                    for expert_idx in range(self.layer_num_experts[meta.layer_id])
+                    if packed_expert_weights.get((param_idx, expert_idx), 0.0) <= 0.0
+                ]
+                if missing_experts:
+                    raise RuntimeError(
+                        f"Packed OLMoE aggregation failure for "
+                        f"'{self.parameter_names[param_idx]}': "
+                        f"missing experts={missing_experts}."
+                    )
 
         if self.defense == "none":
             aggregated = [arr.copy() for arr in baseline]
@@ -1622,6 +1891,19 @@ class MixFedMoEStrategy(FedAvg):
                     raise RuntimeError(f"Zero aggregation weight for parameter idx={param_idx}.")
                 aggregated[param_idx] = (weighted_sum / np.float32(weight)).astype(
                     baseline[param_idx].dtype, copy=False
+                )
+
+            for (param_idx, expert_idx), weighted_sum in packed_expert_sums.items():
+                weight = packed_expert_weights[(param_idx, expert_idx)]
+                if weight <= 0.0:
+                    raise RuntimeError(
+                        f"Zero aggregation weight for packed expert idx={param_idx}, "
+                        f"expert={expert_idx}."
+                    )
+                averaged = weighted_sum / np.float32(weight)
+                aggregated[param_idx][expert_idx] = averaged.astype(
+                    baseline[param_idx].dtype,
+                    copy=False,
                 )
 
             for param_idx, weighted_rows in router_row_sums.items():
@@ -1827,7 +2109,7 @@ class MixFedMoEStrategy(FedAvg):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         checkpoint_interval = int(
-            getattr(self.runtime_config, "checkpoint_interval", 5)
+            getattr(self.runtime_config, "checkpoint_interval", 1)
         )
         is_periodic_round = (
             server_round > 0

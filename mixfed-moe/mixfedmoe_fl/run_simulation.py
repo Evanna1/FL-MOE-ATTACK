@@ -29,6 +29,7 @@ from mixfedmoe_fl.server import (
 from mixfedmoe_fl.strategy import MixFedMoEStrategy
 
 _CLIENT_DATA_MANAGER: Optional[MixFedMoEDataManager] = None
+_CLIENT_CACHE: dict[int, MixFedMoEClient] = {}
 
 
 def _silence_hf_model_loading_logs() -> None:
@@ -74,13 +75,23 @@ def _build_client_app(runtime_config: MixFedMoEConfig) -> ClientApp:
     def client_fn(context: Context) -> Client:
         partition_id = _extract_partition_id(context)
         dm = _get_client_data_manager(runtime_config)
-        client = MixFedMoEClient(
-            client_id=partition_id,
-            runtime_config=runtime_config,
-            data_manager=dm,
-            is_malicious=(partition_id in runtime_config.malicious_clients),
-            client_state=context.state,
-        )
+        # ClientApp can invoke this factory once per message while the Ray
+        # worker process remains alive.  Reuse the Python client (and its
+        # resident GPU model) for the same partition across rounds.
+        client = _CLIENT_CACHE.get(partition_id)
+        if client is None:
+            client = MixFedMoEClient(
+                client_id=partition_id,
+                runtime_config=runtime_config,
+                data_manager=dm,
+                is_malicious=(partition_id in runtime_config.malicious_clients),
+                client_state=context.state,
+            )
+            _CLIENT_CACHE[partition_id] = client
+        else:
+            # Context state is the durable Flower state for this invocation;
+            # refresh the reference while retaining the in-process model.
+            client.client_state = context.state
         return client.to_client()
 
     return ClientApp(client_fn=client_fn)

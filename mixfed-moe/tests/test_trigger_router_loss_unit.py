@@ -201,7 +201,7 @@ def test_trigger_router_loss_supervises_exact_trigger_tokens() -> None:
     gate = torch.nn.Linear(2, 3)
     torch.nn.init.zeros_(gate.weight)
     torch.nn.init.zeros_(gate.bias)
-    objective = TriggerRouterLoss(gate, token_ids=(7, 8), target_expert=2, decoder=False)
+    objective = TriggerRouterLoss(gate, token_ids=(7, 8), target_experts=[2], decoder=False)
     try:
         input_ids = torch.tensor([[10, 7, 8, 1], [7, 8, 0, 0]])
         attention_mask = torch.tensor([[1, 1, 1, 1], [1, 0, 0, 0]])
@@ -231,9 +231,59 @@ def test_trigger_router_loss_supervises_exact_trigger_tokens() -> None:
     assert not gate._forward_hooks
 
 
+def test_trigger_router_loss_supervises_multiple_target_experts() -> None:
+    gate = torch.nn.Linear(2, 4)
+    torch.nn.init.zeros_(gate.weight)
+    torch.nn.init.zeros_(gate.bias)
+    # Two experts injected into the same layer with top-2 routing.
+    objective = TriggerRouterLoss(
+        gate,
+        token_ids=(7, 8),
+        target_experts=[1, 2],
+        decoder=False,
+        routing_top_k=2,
+    )
+    try:
+        assert objective.target_experts == (1, 2)
+        input_ids = torch.tensor([[10, 7, 8, 1]])
+        attention_mask = torch.ones_like(input_ids)
+        objective.begin_batch(input_ids, attention_mask)
+
+        gate(torch.randn(1, 4, 2))
+        loss = objective.loss()
+        loss.backward()
+
+        # Zeroed logits leave every expert tied, so neither target clears the
+        # margin and the hinge contributes the full per-target margin.
+        assert objective.last_margin_loss == 2.0
+        # The route only "hits" when both targets clear the boundary together.
+        assert objective.last_route_rate == 0.0
+        assert gate.weight.grad is not None
+        assert torch.count_nonzero(gate.weight.grad).item() > 0
+    finally:
+        objective.close()
+
+
+def test_trigger_router_loss_rejects_too_many_targets_for_router_width() -> None:
+    gate = torch.nn.Linear(2, 2)
+    objective = TriggerRouterLoss(
+        gate, token_ids=(7, 8), target_experts=[0, 1], decoder=False
+    )
+    try:
+        objective.begin_batch(
+            torch.tensor([[7, 8]]), torch.tensor([[1, 1]])
+        )
+        gate(torch.randn(1, 2, 2))
+        # Two targets need at least three experts to leave a routing boundary.
+        with pytest.raises(RuntimeError, match="more router expert"):
+            objective.loss()
+    finally:
+        objective.close()
+
+
 def test_trigger_router_loss_returns_differentiable_zero_for_clean_batch() -> None:
     gate = torch.nn.Linear(2, 3)
-    objective = TriggerRouterLoss(gate, token_ids=(7, 8), target_expert=1, decoder=True)
+    objective = TriggerRouterLoss(gate, token_ids=(7, 8), target_experts=[1], decoder=True)
     try:
         input_ids = torch.tensor([[10, 11, 12, 1]])
         objective.begin_batch(input_ids, torch.ones_like(input_ids))
@@ -258,7 +308,7 @@ def test_trigger_router_margin_stops_after_robust_buffer() -> None:
     objective = TriggerRouterLoss(
         gate,
         token_ids=(7,),
-        target_expert=2,
+        target_experts=[2],
         decoder=False,
         margin=2.0,
         clean_kl_weight=0.0,
@@ -290,7 +340,7 @@ def test_trigger_router_margin_weight_decays_between_thresholds() -> None:
     objective = TriggerRouterLoss(
         gate,
         token_ids=(7,),
-        target_expert=2,
+        target_experts=[2],
         decoder=False,
         margin=2.0,
         clean_kl_weight=0.0,
@@ -319,7 +369,7 @@ def test_clean_router_kl_remains_active_without_trigger_tokens() -> None:
     objective = TriggerRouterLoss(
         gate,
         token_ids=(7,),
-        target_expert=2,
+        target_experts=[2],
         decoder=False,
         clean_kl_weight=1.0,
     )
@@ -365,7 +415,7 @@ def test_drop_mode_maps_global_target_expert_to_local_router_row() -> None:
     objective = _build_trigger_router_loss(
         moe_handles=[handle],
         target_layer="encoder.0",
-        target_expert=2,
+        target_experts=[2],
         mode="drop",
         assignments={"encoder.0": [0, 2]},
         trigger_token_ids=(7, 8),

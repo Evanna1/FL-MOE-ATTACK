@@ -18,6 +18,9 @@ class SelectedTrigger:
     target_layer: str
     target_expert: int
     trigger_token_ids: Tuple[int, ...] = ()
+    # Optional cross-layer iGCG target metadata.  Legacy files only contain
+    # target_layer/target_expert and continue to deserialize unchanged.
+    target_specs: Tuple[Tuple[str, Tuple[int, ...]], ...] = ()
 
 # load a PyTorch checkpoint and return its state_dict and metadata.
 def load_attack_checkpoint(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -85,6 +88,7 @@ def load_selected_trigger(path: str) -> SelectedTrigger:
     target_layer = target.get("layer_id")
     target_expert = target.get("expert_id")
     raw_trigger_ids = best_trigger.get("trigger_token_ids", [])
+    raw_targets = target.get("targets", [])
     if not isinstance(trigger, str) or not trigger.strip():
         raise ValueError("selected_triggers.json field 'best_trigger.trigger' must be a non-empty string.")
     if not isinstance(target_layer, str) or not target_layer.strip():
@@ -99,11 +103,29 @@ def load_selected_trigger(path: str) -> SelectedTrigger:
             "selected_triggers.json field 'best_trigger.trigger_token_ids' must be a list of integers >= 0."
         )
 
+    target_specs: List[Tuple[str, Tuple[int, ...]]] = []
+    if raw_targets:
+        if not isinstance(raw_targets, list):
+            raise ValueError("selected_triggers.json field 'target.targets' must be a list.")
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                raise ValueError("Each target.targets entry must be an object.")
+            layer_id = item.get("layer_id")
+            expert_ids = item.get("expert_ids")
+            if not isinstance(layer_id, str) or not layer_id.strip():
+                raise ValueError("Each target.targets entry needs a non-empty layer_id.")
+            if not isinstance(expert_ids, list) or not expert_ids:
+                raise ValueError("Each target.targets entry needs a non-empty expert_ids list.")
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in expert_ids):
+                raise ValueError("target.targets expert_ids must contain integers >= 0.")
+            target_specs.append((layer_id.strip(), tuple(int(value) for value in expert_ids)))
+
     return SelectedTrigger(
         trigger=trigger.strip(),
         target_layer=target_layer.strip(),
         target_expert=target_expert,
         trigger_token_ids=tuple(raw_trigger_ids),
+        target_specs=tuple(target_specs),
     )
 
 # Append a fixed text trigger while preserving the original text.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mixfedmoe_fl.config import (
@@ -17,6 +19,27 @@ def test_emotion_uses_namespaced_huggingface_dataset_id() -> None:
 def test_data_distribution_defaults_to_non_iid() -> None:
     cfg = parse_config(["--mode", "full"])
     assert cfg.data_distribution == "non-iid"
+
+
+def test_model_backend_and_dtype_default_to_auto() -> None:
+    cfg = parse_config(["--mode", "full"])
+    assert cfg.model_backend == "auto"
+    assert cfg.model_dtype == "auto"
+
+
+def test_parse_config_accepts_olmoe_bfloat16() -> None:
+    cfg = parse_config(
+        [
+            "--mode",
+            "full",
+            "--model_backend",
+            "olmoe",
+            "--model_dtype",
+            "bfloat16",
+        ]
+    )
+    assert cfg.model_backend == "olmoe"
+    assert cfg.model_dtype == "bfloat16"
 
 
 @pytest.mark.parametrize("value", ["non-iid", "non_iid", "noniid", "niid"])
@@ -124,7 +147,7 @@ def test_parse_config_accepts_badnet_options() -> None:
     assert cfg.attack_start_round == 3
     assert cfg.trigger == "bb"
     assert cfg.trigger_token_ids == ()
-    assert cfg.checkpoint_interval == 5
+    assert cfg.checkpoint_interval == 1
     assert cfg.checkpoint_rounds == (2, 4)
 
 
@@ -181,6 +204,9 @@ def test_parse_config_accepts_independent_a3fl_options() -> None:
 
 
 def test_a3fl_lambda0_defaults_to_paper_value() -> None:
+    # lambda_0 scales the adaptive term in lambda = lambda_0 * sim(theta', theta).
+    # The A3FL paper sweeps lambda_0 over {0.005, 0.01, 0.1, 0.5, 1} and reports
+    # the attack is insensitive to it; we default to the paper's 0.01.
     cfg = parse_config(["--mode", "full"])
 
     assert cfg.a3fl_lambda == 0.01
@@ -218,6 +244,87 @@ def test_cold_expert_profile_promotion_requires_sparse_hot_assignment() -> None:
 
     with pytest.raises(ValueError, match="assignment_policy=hot"):
         parse_config(["--mode", "mix", "--assignment_policy", "random", *base])
+
+
+def test_parse_config_accepts_multiple_target_experts() -> None:
+    cfg = parse_config(
+        [
+            "--mode",
+            "mix",
+            "--assignment_policy",
+            "hot",
+            "--attack_enabled",
+            "--inject_target_expert",
+            "--lfe_target_layer",
+            "decoder.0",
+            "--lfe_target_expert",
+            "19",
+            "47",
+        ]
+    )
+    assert cfg.lfe_target_experts == (19, 47)
+    # The primary expert mirrors the first entry for single-expert diagnostics.
+    assert cfg.lfe_target_expert == 19
+
+
+def test_selected_triggers_file_reads_multiple_target_experts(tmp_path) -> None:
+    selected = tmp_path / "selected_triggers.json"
+    selected.write_text(
+        json.dumps(
+            {
+                "target": {
+                    "layer_id": "decoder.14",
+                    "expert_id": 19,
+                    "expert_ids": [19, 47],
+                    "targets": [
+                        {"layer_id": "decoder.14", "expert_ids": [19, 47]}
+                    ],
+                },
+                "best_trigger": {
+                    "trigger": "Esc ev symp Cec",
+                    "trigger_token_ids": [32629, 45631, 12514, 31661],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = parse_config(
+        [
+            "--mode",
+            "mix",
+            "--assignment_policy",
+            "hot",
+            "--attack_enabled",
+            "--inject_target_expert",
+            "--selected_triggers_path",
+            str(selected),
+        ]
+    )
+    assert cfg.lfe_target_layer == "decoder.14"
+    assert cfg.lfe_target_experts == (19, 47)
+    assert cfg.lfe_target_expert == 19
+    assert cfg.trigger_token_ids == (32629, 45631, 12514, 31661)
+
+
+def test_parse_config_dedupes_target_experts_preserving_order() -> None:
+    cfg = parse_config(
+        [
+            "--mode",
+            "mix",
+            "--assignment_policy",
+            "hot",
+            "--attack_enabled",
+            "--inject_target_expert",
+            "--lfe_target_layer",
+            "decoder.0",
+            "--lfe_target_expert",
+            "47",
+            "19",
+            "47",
+        ]
+    )
+    assert cfg.lfe_target_experts == (47, 19)
+    assert cfg.lfe_target_expert == 47
 
 
 def test_target_router_margin_configuration() -> None:

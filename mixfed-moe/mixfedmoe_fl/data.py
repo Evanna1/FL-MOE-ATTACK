@@ -64,6 +64,10 @@ def build_tokenizer(model_name_or_path: str, max_length: int) -> PreTrainedToken
         raise ValueError("Tokenizer must define eos_token for EOS-based sequence classification.")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Both the existing Switch classifier and the OLMoE wrapper consume the
+    # final valid token.  Right padding keeps EOS at that position in the
+    # project's tokenized examples and is explicit across tokenizer families.
+    tokenizer.padding_side = "right"
     return tokenizer
 
 

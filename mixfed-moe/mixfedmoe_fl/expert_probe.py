@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 from flwr.common import ArrayRecord, NDArrays, RecordDict
@@ -12,6 +12,7 @@ from flwr.common import ArrayRecord, NDArrays, RecordDict
 EXPERT_PARAM_PATTERN = re.compile(
     r"^(encoder|decoder)\.block\.(\d+)\.layer\.\d+\.mlp\.experts\.expert_(\d+)\.(.+)$"
 )
+ExpertParameterParser = Callable[[str], Optional[Tuple[str, int]]]
 PROBE_STATE_KEY = "expert_probe.state_json"
 PROBE_STATE_VERSION = 1
 
@@ -79,8 +80,12 @@ def _empty_state() -> Dict[str, Any]:
     }
 
 
-def load_probe_state(client_state: RecordDict) -> Dict[str, Any]:
-    record = client_state.array_records.get(PROBE_STATE_KEY)
+def load_probe_state(
+    client_state: RecordDict,
+    *,
+    state_key: str = PROBE_STATE_KEY,
+) -> Dict[str, Any]:
+    record = client_state.array_records.get(state_key)
     if record is None:
         return _empty_state()
     arrays = record.to_numpy_ndarrays()
@@ -249,9 +254,14 @@ def rank_candidates_by_boundary_distance(
     return ranked
 
 
-def save_probe_state(client_state: RecordDict, state: Mapping[str, Any]) -> None:
+def save_probe_state(
+    client_state: RecordDict,
+    state: Mapping[str, Any],
+    *,
+    state_key: str = PROBE_STATE_KEY,
+) -> None:
     payload = json.dumps(state, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    client_state.array_records[PROBE_STATE_KEY] = ArrayRecord(
+    client_state.array_records[state_key] = ArrayRecord(
         numpy_ndarrays=[np.frombuffer(payload, dtype=np.uint8).copy()]
     )
 
@@ -305,6 +315,8 @@ def observe_global_and_update_history(
     repetitions: int,
     drift_window: int = 5,
     max_consistency_error: float = float("inf"),
+    parameter_parser: ExpertParameterParser = parse_expert_parameter,
+    automatic_tensor_suffix: str = ".wi.weight",
 ) -> Dict[str, Any]:
     """Decode probes and track low-drift coordinates in one or every MoE layer.
 
@@ -373,13 +385,13 @@ def observe_global_and_update_history(
 
     trackers = state.setdefault("trackers", {})
     for name, array in zip(parameter_names, parameters):
-        parsed = parse_expert_parameter(name)
+        parsed = parameter_parser(name)
         if parsed is None or (target_layer is not None and parsed[0] != target_layer):
             continue
         # Automatic discovery spans many layers.  Tracking one stable,
         # consistently available tensor per expert bounds the persisted JSON
         # state without weakening cross-layer screening.
-        if target_layer is None and not name.endswith(".wi.weight"):
+        if target_layer is None and not name.endswith(automatic_tensor_suffix):
             continue
         values = np.asarray(array)
         if values.size < 2 or not np.issubdtype(values.dtype, np.floating):
@@ -935,6 +947,7 @@ def inject_paired_probe(
     seed: int,
     client_id: int,
     append_pending: bool = False,
+    parameter_parser: ExpertParameterParser = parse_expert_parameter,
 ) -> List[Dict[str, Any]]:
     """Overwrite uploaded coordinates with exact incoming-value +/- probes.
 
@@ -951,7 +964,7 @@ def inject_paired_probe(
         expert_key = f"{target_layer}/expert_{expert_id}"
         candidates: List[Tuple[float, str]] = []
         for name, tracker in trackers.items():
-            if parse_expert_parameter(name) != (target_layer, expert_id):
+            if parameter_parser(name) != (target_layer, expert_id):
                 continue
             if name not in incoming or name not in outgoing_lookup:
                 continue
@@ -1037,6 +1050,7 @@ def rank_lazy_expert_candidates(
     num_experts: int,
     warmup_observations: int,
     pairs: int,
+    parameter_parser: ExpertParameterParser = parse_expert_parameter,
 ) -> List[Dict[str, Any]]:
     """Rank experts by whole-sample activity while retaining safe probe coordinates.
 
@@ -1052,7 +1066,7 @@ def rank_lazy_expert_candidates(
     for expert_id in range(int(num_experts)):
         tensor_candidates: List[Tuple[float, float, float, float, str, int, float]] = []
         for name, tracker in trackers.items():
-            if parse_expert_parameter(name) != (target_layer, expert_id):
+            if parameter_parser(name) != (target_layer, expert_id):
                 continue
             observations = int(tracker.get("observations", 0))
             if observations < int(warmup_observations):
@@ -1130,6 +1144,7 @@ def rank_lazy_candidates_across_layers(
     top_experts_per_layer: int = 2,
     max_layers: int = 0,
     min_layer_contrast: float = 1.0,
+    parameter_parser: ExpertParameterParser = parse_expert_parameter,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Build a scale-normalized, balanced shortlist across all MoE layers.
 
@@ -1146,6 +1161,7 @@ def rank_lazy_candidates_across_layers(
             num_experts=int(layer_num_experts[layer_id]),
             warmup_observations=warmup_observations,
             pairs=pairs,
+            parameter_parser=parameter_parser,
         )
         if not candidates:
             continue
@@ -1287,6 +1303,7 @@ def choose_lazy_probe_expert(
     pairs: int,
     currently_assigned: Sequence[int],
     excluded_experts: Sequence[str] = (),
+    parameter_parser: ExpertParameterParser = parse_expert_parameter,
 ) -> Optional[Dict[str, Any]]:
     """Choose the least-probed lazy expert, preferring one not already assigned."""
     candidates = rank_lazy_expert_candidates(
@@ -1295,6 +1312,7 @@ def choose_lazy_probe_expert(
         num_experts=num_experts,
         warmup_observations=warmup_observations,
         pairs=pairs,
+        parameter_parser=parameter_parser,
     )
     assigned = {int(value) for value in currently_assigned}
     excluded = {str(value) for value in excluded_experts}

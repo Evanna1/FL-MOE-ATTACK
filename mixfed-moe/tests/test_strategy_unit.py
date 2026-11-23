@@ -46,6 +46,7 @@ def _build_config(
     fraction_fit: float = 1.0,
     local_epochs: float = 1.0,
     assignment_policy: str = "hot",
+    coverage_guarantee: bool = True,
 ) -> MixFedMoEConfig:
     return MixFedMoEConfig(
         mode=mode,  # type: ignore[arg-type]
@@ -70,6 +71,7 @@ def _build_config(
         output_dir="outputs/mixfedmoe",
         test_samples=16,
         assignment_policy=assignment_policy,  # type: ignore[arg-type]
+        coverage_guarantee=coverage_guarantee,
     )
 
 
@@ -101,6 +103,7 @@ def _build_strategy(
     fraction_fit: float = 1.0,
     local_epochs: float = 1.0,
     assignment_policy: str = "hot",
+    coverage_guarantee: bool = True,
 ) -> Tuple[MixFedMoEStrategy, Parameters]:
     names = _parameter_names()
     initial_parameters = ndarrays_to_parameters(_initial_arrays())
@@ -112,6 +115,7 @@ def _build_strategy(
             fraction_fit=fraction_fit,
             local_epochs=local_epochs,
             assignment_policy=assignment_policy,
+            coverage_guarantee=coverage_guarantee,
         ),
         parameter_names=names,
         initial_parameters=initial_parameters,
@@ -201,6 +205,35 @@ def test_configure_fit_fails_when_selected_clients_cannot_cover_experts() -> Non
             parameters=initial_parameters,
             client_manager=manager,  # type: ignore[arg-type]
         )
+
+
+def test_round1_no_coverage_allows_small_smoke_test_and_diversifies_clients() -> None:
+    strategy, initial_parameters = _build_strategy(
+        mode="mix",
+        num_clients=1,
+        k=1,
+        coverage_guarantee=False,
+    )
+    manager = DummyClientManager([DummyClientProxy(cid="0")])
+
+    fit_instructions = strategy.configure_fit(
+        server_round=1,
+        parameters=initial_parameters,
+        client_manager=manager,  # type: ignore[arg-type]
+    )
+
+    assert len(fit_instructions) == 1
+    assigned = json.loads(
+        str(fit_instructions[0][1].config["assigned_experts_json"])
+    )
+    assert assigned["encoder.0"] == [0]
+    olmoe_sized = strategy._assign_round1_no_coverage(
+        sorted_cids=["0", "1"],
+        num_experts=64,
+        k=8,
+    )
+    assert olmoe_sized["0"] == list(range(8))
+    assert olmoe_sized["1"] == list(range(8, 16))
 
 
 def test_configure_fit_random_policy_assigns_exact_k_across_rounds() -> None:

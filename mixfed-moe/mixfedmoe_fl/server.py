@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import timeit
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -13,11 +14,21 @@ from torch.utils.data import DataLoader
 from transformers import DataCollatorWithPadding
 
 from mixfedmoe_fl.attack import load_attack_checkpoint
-from mixfedmoe_fl.client import _load_from_numpy_ndarrays, _state_dict_names, collect_moe_handles
+from mixfedmoe_fl.client import (
+    _load_from_numpy_ndarrays,
+    _state_dict_names,
+    _to_numpy_ndarrays,
+    collect_moe_handles,
+)
 from mixfedmoe_fl.config import MixFedMoEConfig
 from mixfedmoe_fl.data import MixFedMoEDataManager
+from mixfedmoe_fl.expert_profiler import TrainingLFERoutingTracker
 from mixfedmoe_fl.logging_utils import RoundMetricsLogger, UPDATE_DIAGNOSTIC_COLUMNS
-from models.switch_transformers import SwitchTransformersForSequenceClassification
+from mixfedmoe_fl.model_factory import (
+    DECODER_ONLY_MOE_BACKENDS,
+    build_sequence_classification_model,
+    get_model_backend,
+)
 
 _HF_LOGS_SILENCED = False
 
@@ -102,9 +113,24 @@ class ExpertProbeEarlyStoppingServer(Server):
         return history, timeit.default_timer() - start_time
 
 
+def _resolve_target_experts(runtime_config) -> Tuple[int, ...]:
+    """Return the full set of target experts, falling back to the primary one."""
+    experts = tuple(
+        int(expert_id) for expert_id in getattr(runtime_config, "lfe_target_experts", ())
+    )
+    if experts:
+        return experts
+    primary = getattr(runtime_config, "lfe_target_expert", None)
+    return () if primary is None else (int(primary),)
+
+
 def _resolve_target_router(model, layer_id: str):
     for handle in collect_moe_handles(model):
         if handle.layer_id == layer_id:
+            if getattr(handle, "backend", None) == "granite":
+                return handle.mlp_module.router
+            if handle.router_module is not None:
+                return handle.router_module
             return handle.mlp_module.router
     return None
 
@@ -121,21 +147,50 @@ class _NaturalTriggerRoutingTracker:
     def __init__(
         self,
         router: torch.nn.Module,
-        target_expert: int,
+        target_experts: Sequence[int],
         trigger_token_ids: Sequence[int],
         decoder: bool = False,
     ) -> None:
-        self.target_expert = int(target_expert)
+        self.target_experts: Tuple[int, ...] = tuple(
+            int(expert_id) for expert_id in target_experts
+        )
+        if not self.target_experts:
+            raise ValueError("Natural trigger routing requires at least one target expert.")
+        if len(set(self.target_experts)) != len(self.target_experts):
+            raise ValueError("Natural trigger routing target experts must be unique.")
+        # The primary expert preserves the single-expert scalar diagnostics.
+        self.target_expert = self.target_experts[0]
         self.trigger_token_ids = tuple(int(token_id) for token_id in trigger_token_ids)
         if not self.trigger_token_ids:
             raise ValueError("Natural trigger routing requires non-empty trigger_token_ids.")
         self.decoder = bool(decoder)
         self._trigger_mask: Optional[torch.Tensor] = None
-        self.target_probability_sum = 0.0
-        self.top1_hits = 0
-        self.actual_hits = 0
+        # Per-expert accumulators keyed by global expert id.
+        self.per_expert_probability_sum: Dict[int, float] = {
+            expert_id: 0.0 for expert_id in self.target_experts
+        }
+        self.per_expert_top1_hits: Dict[int, int] = {
+            expert_id: 0 for expert_id in self.target_experts
+        }
+        self.per_expert_actual_hits: Dict[int, int] = {
+            expert_id: 0 for expert_id in self.target_experts
+        }
+        # "joint" counts tokens where every target expert fired together.
+        self.joint_top1_hits = 0
+        self.joint_actual_hits = 0
         self.num_trigger_tokens = 0
-        self._classifier_handle = router.classifier.register_forward_hook(self._classifier_hook)
+        classifier = getattr(router, "classifier", None)
+        self._is_granite = classifier is None and isinstance(
+            getattr(router, "layer", None), torch.nn.Module
+        )
+        if self._is_granite:
+            classifier = router.layer
+        self._is_olmoe = not isinstance(classifier, torch.nn.Module)
+        self._classifier_handle = (
+            None
+            if self._is_olmoe
+            else classifier.register_forward_hook(self._classifier_hook)
+        )
         self._router_handle = router.register_forward_hook(self._router_hook)
 
     def begin_batch(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
@@ -174,33 +229,141 @@ class _NaturalTriggerRoutingTracker:
             )
         return flattened[self._trigger_mask]
 
+    def _check_experts_in_range(self, num_experts: int) -> None:
+        for expert_id in self.target_experts:
+            if not 0 <= expert_id < num_experts:
+                raise ValueError("Target expert is outside the router output range.")
+
     def _classifier_hook(self, _module, _inputs, output: torch.Tensor) -> None:
         selected_logits = self._selected_rows(output)
-        if not 0 <= self.target_expert < selected_logits.shape[-1]:
-            raise ValueError("Target expert is outside the router output range.")
+        self._check_experts_in_range(selected_logits.shape[-1])
         probabilities = torch.softmax(selected_logits.float(), dim=-1)
-        self.target_probability_sum += float(probabilities[:, self.target_expert].sum().item())
-        self.top1_hits += int(selected_logits.argmax(dim=-1).eq(self.target_expert).sum().item())
+        argmax = selected_logits.argmax(dim=-1)
+        for expert_id in self.target_experts:
+            self.per_expert_probability_sum[expert_id] += float(
+                probabilities[:, expert_id].sum().item()
+            )
+            self.per_expert_top1_hits[expert_id] += int(
+                argmax.eq(expert_id).sum().item()
+            )
+        # The router emits a single top-1 choice, so a joint top-1 hit only
+        # exists when exactly one expert is targeted.
+        if len(self.target_experts) == 1:
+            self.joint_top1_hits += int(argmax.eq(self.target_expert).sum().item())
         self.num_trigger_tokens += int(selected_logits.shape[0])
+
+    def _accumulate_membership(self, memberships: Sequence[torch.Tensor]) -> None:
+        """Record per-expert admission and the joint "all experts fired" count."""
+        joint = memberships[0]
+        for expert_id, membership in zip(self.target_experts, memberships):
+            self.per_expert_actual_hits[expert_id] += int(membership.sum().item())
+        for membership in memberships[1:]:
+            joint = joint & membership
+        self.joint_actual_hits += int(joint.sum().item())
 
     def _router_hook(self, _module, _inputs, output) -> None:
         if not isinstance(output, tuple) or len(output) < 2:
             raise RuntimeError("Target router did not return its capacity-masked expert assignment.")
+        if self._is_granite:
+            if len(output) < 5 or not isinstance(output[4], torch.Tensor):
+                raise RuntimeError("Granite router did not return routing logits.")
+            selected_logits = self._selected_rows(output[4]).float()
+            self._check_experts_in_range(selected_logits.shape[-1])
+            top_k = int(getattr(_module, "top_k", 1))
+            selected_indices = selected_logits.topk(
+                min(top_k, selected_logits.shape[-1]), dim=-1
+            ).indices
+            memberships = [
+                selected_indices.eq(expert_id).any(dim=-1)
+                for expert_id in self.target_experts
+            ]
+            self._accumulate_membership(memberships)
+            self._trigger_mask = None
+            return
+        if self._is_olmoe:
+            if len(output) < 3:
+                raise RuntimeError(
+                    "OLMoE router did not return probabilities, scores, and Top-K indices."
+                )
+            selected_probabilities = self._selected_rows(output[0]).float()
+            self._check_experts_in_range(selected_probabilities.shape[-1])
+            selected_indices = self._selected_rows(output[2])
+            argmax = selected_probabilities.argmax(dim=-1)
+            for expert_id in self.target_experts:
+                self.per_expert_probability_sum[expert_id] += float(
+                    selected_probabilities[:, expert_id].sum().item()
+                )
+                self.per_expert_top1_hits[expert_id] += int(
+                    argmax.eq(expert_id).sum().item()
+                )
+            if len(self.target_experts) == 1:
+                self.joint_top1_hits += int(argmax.eq(self.target_expert).sum().item())
+            memberships = [
+                selected_indices.eq(expert_id).any(dim=-1)
+                for expert_id in self.target_experts
+            ]
+            self._accumulate_membership(memberships)
+            self.num_trigger_tokens += int(selected_probabilities.shape[0])
+            self._trigger_mask = None
+            return
         selected_experts = self._selected_rows(output[1])
-        self.actual_hits += int(selected_experts[:, self.target_expert].bool().sum().item())
+        self._check_experts_in_range(selected_experts.shape[-1])
+        memberships = [
+            selected_experts[:, expert_id].bool() for expert_id in self.target_experts
+        ]
+        self._accumulate_membership(memberships)
         self._trigger_mask = None
 
-    def metrics(self) -> Dict[str, float | int]:
+    def metrics(self) -> Dict[str, float | int | str]:
         denominator = max(self.num_trigger_tokens, 1)
+        primary = self.target_expert
+        per_expert = {
+            str(expert_id): {
+                "probability": float(
+                    self.per_expert_probability_sum[expert_id] / denominator
+                ),
+                "top1_hit_rate": float(
+                    self.per_expert_top1_hits[expert_id] / denominator
+                ),
+                # "hit_rate" here is admission into the expert's top-k, i.e. the
+                # token was actually routed to the expert.
+                "hit_rate": float(self.per_expert_actual_hits[expert_id] / denominator),
+            }
+            for expert_id in self.target_experts
+        }
+        mean_probability = float(
+            sum(self.per_expert_probability_sum.values())
+            / (len(self.target_experts) * denominator)
+        )
         return {
-            "trigger_target_probability": float(self.target_probability_sum / denominator),
-            "trigger_target_hit_rate": float(self.top1_hits / denominator),
-            "trigger_target_execution_rate": float(self.actual_hits / denominator),
+            # Legacy scalar columns remain bound to the primary (first) expert so
+            # existing single-expert dashboards and tests are unchanged.
+            "trigger_target_probability": float(
+                self.per_expert_probability_sum[primary] / denominator
+            ),
+            "trigger_target_hit_rate": float(
+                self.per_expert_top1_hits[primary] / denominator
+            ),
+            "trigger_target_execution_rate": float(
+                self.per_expert_actual_hits[primary] / denominator
+            ),
             "trigger_routing_tokens": int(self.num_trigger_tokens),
+            # Multi-expert injection: the headline is the joint probability that
+            # *every* target expert was routed to by the same trigger token.
+            "trigger_target_num_experts": int(len(self.target_experts)),
+            "trigger_target_experts": ",".join(
+                str(expert_id) for expert_id in self.target_experts
+            ),
+            "trigger_target_joint_hit_rate": float(
+                self.joint_actual_hits / denominator
+            ),
+            "trigger_target_mean_probability": mean_probability,
+            "trigger_target_per_expert_json": json.dumps(per_expert, sort_keys=True),
         }
 
     def remove(self) -> None:
-        self._classifier_handle.remove()
+        if self._classifier_handle is not None:
+            self._classifier_handle.remove()
         self._router_handle.remove()
 
 
@@ -256,27 +419,20 @@ def _silence_hf_loading_logs_once() -> None:
 def build_server_model(
     runtime_config: MixFedMoEConfig,
     data_manager: MixFedMoEDataManager,
-) -> SwitchTransformersForSequenceClassification:
+) -> torch.nn.Module:
     _silence_hf_loading_logs_once()
     label_info = data_manager.get_label_info()
-    model = SwitchTransformersForSequenceClassification.from_pretrained(
+    return build_sequence_classification_model(
         runtime_config.model_name_or_path,
         num_labels=label_info.num_labels,
         id2label=label_info.id2label,
         label2id=label_info.label2id,
+        tokenizer=data_manager.tokenizer,
+        model_backend=runtime_config.model_backend,
+        model_dtype=runtime_config.model_dtype,
         ignore_mismatched_sizes=True,
-        torch_dtype=torch.float32,
-        tie_word_embeddings=False,
+        router_aux_loss_coef=runtime_config.router_aux_loss_coef,
     )
-    tokenizer = data_manager.tokenizer
-    if model.config.pad_token_id is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-    if model.config.eos_token_id is None:
-        model.config.eos_token_id = tokenizer.eos_token_id
-    if model.config.decoder_start_token_id is None:
-        model.config.decoder_start_token_id = model.config.pad_token_id
-    model.config.use_cache = False
-    return model
 
 
 def build_initial_parameters(
@@ -306,13 +462,74 @@ def build_initial_parameters(
                 flush=True,
             )
         parameter_names = _state_dict_names(model)
-        arrays: NDArrays = [model.state_dict()[name].detach().cpu().numpy().copy() for name in parameter_names]
+        # NumPy cannot represent torch.bfloat16 directly.  Reuse the same
+        # transport conversion as clients so OLMoE's BF16 checkpoint can be
+        # serialized into Flower Parameters during server initialization.
+        arrays = _to_numpy_ndarrays(model, parameter_names)
     finally:
         model.cpu()
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return parameter_names, ndarrays_to_parameters(arrays)
+
+
+def _print_clean_routing(
+    server_round: int,
+    runtime_config: MixFedMoEConfig,
+    clean_profile: Dict[str, Any],
+) -> None:
+    """Log the aggregated model's real per-expert token routing on clean data.
+
+    Chooses the configured target layer when present, otherwise the first MoE
+    layer. Reports raw counts plus collapse indicators (dead experts, max token
+    share, normalized routing entropy) so routing collapse is distinguishable
+    from by-design sparsity at a glance.
+    """
+    layers = clean_profile.get("layers", {})
+    if not layers:
+        return
+    log_layer = (
+        runtime_config.lfe_target_layer
+        if runtime_config.lfe_target_layer in layers
+        else next(iter(layers))
+    )
+    layer_profile = layers[log_layer]
+    counts = [int(value) for value in layer_profile["counts"]]
+    freqs = [float(value) for value in layer_profile["frequencies"]]
+    valid_tokens = int(layer_profile["valid_tokens"])
+    dead = sum(1 for value in counts if value == 0)
+    max_share = max(freqs) if freqs else 0.0
+    # Normalize the per-expert selection counts into a proper load distribution
+    # before measuring entropy. With Top-K>1 routing each token is counted K
+    # times, so the raw frequencies sum to K, not 1; dividing by their total is
+    # what keeps norm_entropy in [0, 1].
+    total_selections = sum(counts)
+    probs = (
+        [value / total_selections for value in counts if value > 0]
+        if total_selections > 0
+        else []
+    )
+    entropy = -sum(p * math.log(p) for p in probs)
+    max_entropy = math.log(len(counts)) if len(counts) > 1 else 0.0
+    norm_entropy = (entropy / max_entropy) if max_entropy > 0.0 else 0.0
+    uniform_share = (
+        float(layer_profile.get("router_top_k") or 1) / len(counts) if counts else 0.0
+    )
+    freq_str = "[" + ", ".join(f"{value:.3f}" for value in freqs) + "]"
+    print(
+        f"[MixFedMoE][round={server_round}] clean_routing@{log_layer} "
+        f"(valid_tokens={valid_tokens}, top_k={layer_profile.get('router_top_k')}): "
+        f"counts={counts}",
+        flush=True,
+    )
+    print(
+        f"[MixFedMoE][round={server_round}] clean_routing@{log_layer} freq={freq_str} | "
+        f"dead_experts={dead}/{len(counts)} max_share={max_share:.3f} "
+        f"(uniform={uniform_share:.3f}) norm_entropy={norm_entropy:.3f} "
+        f"(1.0=uniform, ->0=collapsed)",
+        flush=True,
+    )
 
 
 def make_central_evaluate_fn(
@@ -392,32 +609,60 @@ def make_central_evaluate_fn(
             total_loss = 0.0
             total_examples = 0
             total_correct = 0
-            with torch.no_grad():
-                for batch in clean_loader:
-                    input_ids = batch["input_ids"].to(device)
-                    attention_mask = batch["attention_mask"].to(device)
-                    labels = batch["labels"].to(device)
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                    if outputs.loss is None:
-                        raise RuntimeError("Server evaluation got loss=None from model forward.")
-                    batch_size = int(labels.shape[0])
-                    logits = outputs.logits
-                    preds = torch.argmax(logits, dim=-1)
-                    total_correct += int((preds == labels).sum().item())
-                    total_loss += float(outputs.loss.item()) * batch_size
-                    total_examples += batch_size
+            # Global honest routing on the clean test set. Unlike contributors@<layer>
+            # (an aggregation-side client-assignment count) or the per-client
+            # routing@<layer> log, this measures the router's own token
+            # distribution over the real held-out data on the aggregated model,
+            # so it is the authoritative signal for whether routing has collapsed
+            # (few experts hold all tokens, the rest are dead) rather than being
+            # sparse by design. Best-effort: never let monitoring break eval.
+            clean_routing_tracker: Optional[TrainingLFERoutingTracker] = None
+            try:
+                clean_routing_tracker = TrainingLFERoutingTracker(
+                    moe_handles=collect_moe_handles(model),
+                    top_k=runtime_config.lfe_top_k,
+                    expert_id_maps=None,
+                    allow_empty=True,
+                )
+            except Exception as error:  # noqa: BLE001 - monitoring must not break eval
+                print(
+                    f"[MixFedMoE][round={server_round}] clean routing monitor disabled: {error}",
+                    flush=True,
+                )
+                clean_routing_tracker = None
+            try:
+                with torch.no_grad():
+                    for batch in clean_loader:
+                        input_ids = batch["input_ids"].to(device)
+                        attention_mask = batch["attention_mask"].to(device)
+                        labels = batch["labels"].to(device)
+                        if clean_routing_tracker is not None:
+                            clean_routing_tracker.begin_batch(attention_mask)
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                        if outputs.loss is None:
+                            raise RuntimeError("Server evaluation got loss=None from model forward.")
+                        batch_size = int(labels.shape[0])
+                        logits = outputs.logits
+                        preds = torch.argmax(logits, dim=-1)
+                        total_correct += int((preds == labels).sum().item())
+                        total_loss += float(outputs.loss.item()) * batch_size
+                        total_examples += batch_size
+            finally:
+                if clean_routing_tracker is not None:
+                    clean_profile = clean_routing_tracker.finish()
+                    _print_clean_routing(server_round, runtime_config, clean_profile)
 
             eval_loss = float(total_loss / max(total_examples, 1))
             eval_accuracy = float(total_correct / max(total_examples, 1))
 
             attack_success_rate = None
-            trigger_routing_metrics: Optional[Dict[str, float | int]] = None
+            trigger_routing_metrics: Optional[Dict[str, float | int | str]] = None
             if triggered_loader is not None:
                 triggered_examples = 0
                 target_predictions = 0
@@ -435,9 +680,12 @@ def make_central_evaluate_fn(
                         )
                     routing_tracker = _NaturalTriggerRoutingTracker(
                         target_router,
-                        int(runtime_config.lfe_target_expert),
+                        _resolve_target_experts(runtime_config),
                         runtime_config.trigger_token_ids,
-                        decoder=runtime_config.lfe_target_layer.startswith("decoder."),
+                        decoder=(
+                            runtime_config.lfe_target_layer.startswith("decoder.")
+                            and get_model_backend(model) not in DECODER_ONLY_MOE_BACKENDS
+                        ),
                     )
                 elif (
                     runtime_config.attack_mode != "a3fl"
@@ -544,6 +792,16 @@ def make_central_evaluate_fn(
                     if trigger_routing_metrics is not None
                     else ""
                 ),
+                "trigger_target_joint_hit_rate": (
+                    trigger_routing_metrics["trigger_target_joint_hit_rate"]
+                    if trigger_routing_metrics is not None
+                    else ""
+                ),
+                "trigger_target_per_expert_json": (
+                    trigger_routing_metrics["trigger_target_per_expert_json"]
+                    if trigger_routing_metrics is not None
+                    else ""
+                ),
                 "train_loss": float(metrics["train_loss"]) if "train_loss" in metrics else "",
                 "round_time": float(metrics["round_time"]) if "round_time" in metrics else 0.0,
                 "cumulative_time": float(metrics["cumulative_time"]) if "cumulative_time" in metrics else 0.0,
@@ -577,6 +835,11 @@ def make_central_evaluate_fn(
                         f" TriggerRouteHit={trigger_routing_metrics['trigger_target_hit_rate']:.6f}"
                         f" TriggerExecHit={trigger_routing_metrics['trigger_target_execution_rate']:.6f}"
                     )
+                    if int(trigger_routing_metrics.get("trigger_target_num_experts", 1)) > 1:
+                        routing += (
+                            f" TriggerJointHit={trigger_routing_metrics['trigger_target_joint_hit_rate']:.6f}"
+                            f" (experts {trigger_routing_metrics['trigger_target_experts']})"
+                        )
                 print(
                     f"[MixFedMoE][round={server_round}] "
                     f"Clean Accuracy={eval_accuracy:.6f} ASR={attack_success_rate:.6f}{routing}"

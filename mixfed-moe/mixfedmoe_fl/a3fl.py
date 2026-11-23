@@ -25,11 +25,12 @@ class A3FLSearchConfig:
     candidate_batch_size: int = 32
     top_k: int = 32
     adversarial_steps: int = 1
-    adversarial_lr: float = 2e-5
+    adversarial_lr: float = 0.01
     lambda0: float = 0.01
     early_stop_asr: float = 0.95
     max_length: int = 256
     seed: int = 42
+    olmoe_adversarial_scope: str = "shared_router"
 
 
 @dataclass(frozen=True)
@@ -127,15 +128,31 @@ def append_token_trigger(
     )
 
 
-def _snapshot_state(model: nn.Module) -> Dict[str, torch.Tensor]:
+def _snapshot_state(
+    model: nn.Module,
+    parameter_names: Optional[Sequence[str]] = None,
+) -> Dict[str, torch.Tensor]:
+    selected = None if parameter_names is None else set(parameter_names)
     return {
         name: value.detach().to(device="cpu", copy=True)
         for name, value in model.state_dict().items()
+        if selected is None or name in selected
     }
 
 
 def _load_snapshot(model: nn.Module, state: Mapping[str, torch.Tensor]) -> None:
-    model.load_state_dict(state, strict=True)
+    current = model.state_dict()
+    unknown = [name for name in state if name not in current]
+    if unknown:
+        raise KeyError(f"A3FL snapshot contains unknown parameter '{unknown[0]}'.")
+    for name, value in state.items():
+        if tuple(value.shape) != tuple(current[name].shape):
+            raise ValueError(
+                f"A3FL snapshot shape mismatch for '{name}': "
+                f"snapshot={tuple(value.shape)} model={tuple(current[name].shape)}."
+            )
+        current[name] = value
+    model.load_state_dict(current, strict=True)
 
 
 def _model_parameter_cosine_similarity(
@@ -152,12 +169,16 @@ def _model_parameter_cosine_similarity(
     dot_product = 0.0
     global_squared_norm = 0.0
     adversarial_squared_norm = 0.0
-    for name, parameter in global_model.named_parameters():
-        if name not in adversarial_state:
-            raise KeyError(f"Adversarial A3FL state is missing parameter '{name}'.")
+    global_parameters = dict(global_model.named_parameters())
+    for name, adversarial_tensor in adversarial_state.items():
+        if name not in global_parameters:
+            # State snapshots can contain buffers; model similarity is defined
+            # over trainable parameters only.
+            continue
+        parameter = global_parameters[name]
         global_values = parameter.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
         adversarial_values = (
-            adversarial_state[name].detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+            adversarial_tensor.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
         )
         if global_values.shape != adversarial_values.shape:
             raise ValueError(
@@ -254,6 +275,72 @@ class A3FLTriggerOptimizer:
         self.excluded_token_ids = tuple(int(value) for value in excluded_token_ids)
         self.decode_trigger = decode_trigger
         self.rng = random.Random(config.seed)
+        self._olmoe = (
+            str(getattr(getattr(model, "config", None), "model_type", ""))
+            == "olmoe"
+        )
+        self._granite = str(
+            getattr(getattr(model, "config", None), "model_type", "")
+        ).lower() in {"granitemoe", "granite_moe"}
+        self._adversarial_parameter_names = self._resolve_adversarial_parameter_names()
+
+    def _resolve_adversarial_parameter_names(self) -> Tuple[str, ...]:
+        """Return the parameters used by the adversarial unlearning model.
+
+        A full packed-MoE adversarial clone would duplicate the complete
+        parameters and make A3FL impractical on one A800.  Its local mix update
+        changes shared embeddings, the classifier, and routers in addition to
+        assigned experts.  Before assignments are installed, use those shared
+        and router parameters as a conservative, memory-bounded unlearning
+        surrogate. Switch keeps its original all-parameter behavior.
+        """
+
+        named = dict(self.model.named_parameters())
+        scope = str(self.config.olmoe_adversarial_scope).lower()
+        if scope not in {"shared_router", "full"}:
+            raise ValueError(
+                "A3FL packed-MoE adversarial scope must be 'shared_router' or 'full'."
+            )
+        if not (self._olmoe or self._granite) or scope == "full":
+            return tuple(named)
+
+        selected_ids: set[int] = set()
+        embedding = self.model.get_input_embeddings()
+        if isinstance(embedding, nn.Module):
+            selected_ids.update(id(parameter) for parameter in embedding.parameters())
+        classification_head = getattr(self.model, "classification_head", None)
+        if isinstance(classification_head, nn.Module):
+            selected_ids.update(
+                id(parameter) for parameter in classification_head.parameters()
+            )
+        backbone = getattr(self.model, "model", None)
+        layers = getattr(backbone, "layers", ())
+        for layer in layers:
+            if self._olmoe:
+                router = getattr(getattr(layer, "mlp", None), "gate", None)
+            else:
+                router = getattr(
+                    getattr(getattr(layer, "block_sparse_moe", None), "router", None),
+                    "layer",
+                    None,
+                )
+            if isinstance(router, nn.Module):
+                selected_ids.update(id(parameter) for parameter in router.parameters())
+        names = tuple(
+            name for name, parameter in named.items() if id(parameter) in selected_ids
+        )
+        if not names:
+            raise RuntimeError("A3FL found no packed-MoE adversarial parameters.")
+        return names
+
+    def _load_adversarial_state(
+        self,
+        state: Mapping[str, torch.Tensor],
+    ) -> None:
+        # Partial OLMoE snapshots are overlays on the pristine downloaded
+        # global model, never on a previously loaded adversarial state.
+        self.restore_global()
+        _load_snapshot(self.model, state)
 
     @property
     def device(self) -> torch.device:
@@ -389,9 +476,17 @@ class A3FLTriggerOptimizer:
         self, batch: Mapping[str, torch.Tensor], trigger_ids: Sequence[int]
     ) -> None:
         self.model.train()
-        self.model.requires_grad_(True)
+        self.model.requires_grad_(False)
+        named_parameters = dict(self.model.named_parameters())
+        adversarial_parameters = []
+        for name in self._adversarial_parameter_names:
+            if name not in named_parameters:
+                raise KeyError(f"A3FL adversarial parameter '{name}' is missing.")
+            parameter = named_parameters[name]
+            parameter.requires_grad_(True)
+            adversarial_parameters.append(parameter)
         optimizer = torch.optim.SGD(
-            self.model.parameters(), lr=self.config.adversarial_lr
+            adversarial_parameters, lr=self.config.adversarial_lr
         )
         prepared = self._prepare(batch, trigger_ids)
         try:
@@ -427,9 +522,16 @@ class A3FLTriggerOptimizer:
         adversarial_state: Optional[Dict[str, torch.Tensor]] = None
         try:
             self.restore_global()
-            # Algorithm 1 initializes the adversarial model from the current
-            # global model, then alternates trigger optimization and unlearning.
-            adversarial_state = _snapshot_state(self.model)
+            # Algorithm 1: initialize the adversarial model theta' from the
+            # current global model, then alternate (optimize the trigger on theta
+            # AND theta') with (adapt theta' to unlearn the trigger).  Per the
+            # paper the trigger is optimized BEFORE theta' is adapted, so the
+            # first outer step runs against theta'=theta (adversarial term equals
+            # the global term) and the adaptation accumulates over later steps.
+            adversarial_state = _snapshot_state(
+                self.model,
+                self._adversarial_parameter_names,
+            )
             for outer_step in range(self.config.outer_steps):
                 self.restore_global()
                 model_similarity = _model_parameter_cosine_similarity(
@@ -437,8 +539,15 @@ class A3FLTriggerOptimizer:
                 )
                 # Paper setting: lambda = lambda_0 * sim(theta'_t, theta_t).
                 adversarial_weight = self.config.lambda0 * model_similarity
+                print(
+                    f"[A3FL] outer={outer_step} "
+                    f"sim(theta',theta)={model_similarity:.4f} "
+                    f"adv_weight={adversarial_weight:.4f} "
+                    f"trigger={list(current)}",
+                    flush=True,
+                )
                 for trigger_step in range(self.config.trigger_steps):
-                    _load_snapshot(self.model, adversarial_state)
+                    self._load_adversarial_state(adversarial_state)
                     adversarial_gradient = self._gradient(batch, current)
 
                     self.restore_global()
@@ -459,7 +568,7 @@ class A3FLTriggerOptimizer:
                         rng=self.rng,
                     )
                     global_losses = self._evaluate_candidates(batch, candidates)
-                    _load_snapshot(self.model, adversarial_state)
+                    self._load_adversarial_state(adversarial_state)
                     adversarial_losses = self._evaluate_candidates(batch, candidates)
                     combined_losses = [
                         global_loss
@@ -473,7 +582,7 @@ class A3FLTriggerOptimizer:
 
                     self.restore_global()
                     global_metrics = self._metrics(batch, current)
-                    _load_snapshot(self.model, adversarial_state)
+                    self._load_adversarial_state(adversarial_state)
                     adversarial_metrics = self._metrics(batch, current)
                     if (
                         global_metrics.attack_success_rate >= self.config.early_stop_asr
@@ -481,21 +590,25 @@ class A3FLTriggerOptimizer:
                     ):
                         break
 
-                # Train theta'_t on triggered inputs with their true labels so
-                # it explicitly attempts to erase the newly selected trigger.
-                _load_snapshot(self.model, adversarial_state)
+                # Adapt theta'_t AFTER the trigger search (Algorithm 1, line 10):
+                # train it to classify triggered inputs as their TRUE labels so it
+                # explicitly unlearns the trigger just selected.
+                self._load_adversarial_state(adversarial_state)
                 self._train_adversarial_model(batch, current)
-                # Drop the previous snapshot before allocating the next full CPU
-                # state, limiting peak host memory for large Switch models.
+                # Drop the previous snapshot before allocating the next CPU state
+                # to limit peak host memory.
                 adversarial_state = None
-                adversarial_state = _snapshot_state(self.model)
+                adversarial_state = _snapshot_state(
+                    self.model,
+                    self._adversarial_parameter_names,
+                )
 
             self.restore_global()
             global_metrics = self._metrics(batch, current)
             if adversarial_state is None:
                 adversarial_metrics = global_metrics
             else:
-                _load_snapshot(self.model, adversarial_state)
+                self._load_adversarial_state(adversarial_state)
                 adversarial_metrics = self._metrics(batch, current)
             trigger_text = (
                 self.decode_trigger(current) if self.decode_trigger is not None else str(current)

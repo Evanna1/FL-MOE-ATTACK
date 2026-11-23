@@ -101,6 +101,22 @@ def test_routing_objective_reports_target_logit_margin() -> None:
     assert margin.item() == pytest.approx(1.0)
 
 
+def test_multi_expert_target_uses_joint_probability_and_all_target_hit_rate() -> None:
+    logits = torch.tensor([[[5.0, 4.0, 3.0, 0.0], [0.0, 0.0, 0.0, 0.0]]])
+    mask = torch.tensor([[True, False]])
+
+    _loss, probability, hit_rate, margin = compute_routing_objective(
+        logits,
+        mask,
+        target_expert=(0, 1),
+        routing_top_k=3,
+    )
+
+    assert probability.item() == pytest.approx(0.905909, rel=1e-5)
+    assert hit_rate.item() == 1.0
+    assert margin.item() == pytest.approx(1.0)
+
+
 def test_heldout_selection_prioritizes_hit_rate_then_margin() -> None:
     lower_hit = TriggerMetrics(0.01, 0.99, 0.8, 10.0)
     higher_hit = TriggerMetrics(2.0, 0.20, 0.9, -0.5)

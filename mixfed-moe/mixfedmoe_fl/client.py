@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import gc
+import functools
 import json
+import os
+import weakref
 import logging
 import math
 import random
@@ -31,6 +34,28 @@ from mixfedmoe_fl.expert_profiler import (
     TrainingLFERoutingTracker,
     save_training_lfe_profile,
 )
+from mixfedmoe_fl.model_factory import (
+    DECODER_ONLY_MOE_BACKENDS,
+    build_sequence_classification_model,
+    get_model_backend,
+)
+from mixfedmoe_fl.olmoe_adapter import OlmoeAdapter
+from mixfedmoe_fl.granite_adapter import (
+    GraniteAdapter,
+    granite_probe_parameter_views,
+    parse_granite_probe_parameter,
+)
+from mixfedmoe_fl.olmoe_probe_adapter import (
+    capture_olmoe_router_logits,
+    choose_olmoe_lazy_probe_expert,
+    inject_olmoe_paired_probe,
+    load_olmoe_probe_state,
+    observe_olmoe_global_and_update_history,
+    rank_olmoe_candidates_by_boundary_distance,
+    rank_olmoe_lazy_candidates_across_layers,
+    rank_olmoe_lazy_expert_candidates,
+    save_olmoe_probe_state,
+)
 from mixfedmoe_fl.expert_probe import (
     advance_batch_probe_confirmation,
     advance_probe_confirmation,
@@ -48,7 +73,6 @@ from mixfedmoe_fl.expert_probe import (
     rank_lazy_expert_candidates,
     save_probe_state,
 )
-from models.switch_transformers import SwitchTransformersForSequenceClassification
 
 LAYER_KEY_PATTERN = re.compile(r"^(encoder|decoder)\.(\d+)$")
 EXPERT_GRADIENT_PARAMETER_PATTERN = re.compile(
@@ -56,6 +80,19 @@ EXPERT_GRADIENT_PARAMETER_PATTERN = re.compile(
 )
 ROUTER_GRADIENT_PARAMETER_PATTERN = re.compile(
     r"^(encoder|decoder)\.block\.(\d+)\.layer\.\d+\.mlp\.router\.classifier\.(weight|bias)$"
+)
+OLMOE_EXPERT_GRADIENT_PARAMETER_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.selected_"
+    r"(gate_up_proj|down_proj)\.(\d+)$"
+)
+OLMOE_ROUTER_GRADIENT_PARAMETER_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.gate\.weight$"
+)
+GRANITE_EXPERT_GRADIENT_PARAMETER_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.block_sparse_moe\.(input_linear|output_linear)\.selected_weight\.(\d+)$"
+)
+GRANITE_ROUTER_GRADIENT_PARAMETER_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.block_sparse_moe\.router\.layer\.weight$"
 )
 _HF_LOGS_SILENCED = False
 _NEUROTOXIN_PREVIOUS_GLOBAL_KEY = "neurotoxin.previous_global"
@@ -164,6 +201,109 @@ def _as_str(config: Dict[str, Scalar], key: str, default: str) -> str:
     if isinstance(value, (str, int, float, bool)):
         return str(value)
     raise ValueError(f"Config key '{key}' must be string-castable, got type={type(value)}")
+
+
+def _build_adamw_optimizer(
+    params: List[torch.nn.Parameter],
+    *,
+    lr: float,
+    weight_decay: float,
+    use_8bit: bool,
+    device: Optional[torch.device] = None,
+) -> torch.optim.Optimizer:
+    """Build the local-training optimizer.
+
+    With ``use_8bit`` the optimizer moments are quantized to 8-bit via
+    bitsandbytes (params and grads stay full precision), cutting the
+    optimizer-state footprint ~4x so large-backbone MoE fits on one GPU.
+    8-bit AdamW is now on by default, so a missing bitsandbytes install or a
+    non-CUDA device (bitsandbytes 8-bit optimizers are CUDA-only) must not
+    break the run: fall back to full-precision AdamW with a visible warning.
+    """
+
+    if not use_8bit:
+        return AdamW(params, lr=lr, weight_decay=weight_decay)
+    on_cuda = (
+        torch.device(device).type == "cuda"
+        if device is not None
+        else torch.cuda.is_available()
+    )
+    if not on_cuda:
+        print(
+            "[MixFedMoE] use_8bit_adam is on but the training device is not CUDA; "
+            "bitsandbytes 8-bit optimizers are CUDA-only, falling back to AdamW.",
+            flush=True,
+        )
+        return AdamW(params, lr=lr, weight_decay=weight_decay)
+    try:
+        import bitsandbytes as bnb
+    except ImportError:  # pragma: no cover - depends on optional install
+        print(
+            "[MixFedMoE] use_8bit_adam is on but the 'bitsandbytes' package is not "
+            "installed (pip install bitsandbytes); falling back to AdamW.",
+            flush=True,
+        )
+        return AdamW(params, lr=lr, weight_decay=weight_decay)
+    return bnb.optim.AdamW8bit(params, lr=lr, weight_decay=weight_decay)
+
+
+# Every MixFedMoEClient created in this worker process registers here.  The
+# simulation maps several Flower cids onto one Ray actor (one process == one
+# physical GPU), and each cid caches its own resident model on that GPU.  To
+# hand the evaluation card back we must drop *all* of this process's resident
+# models, not just the one whose fit just ran.
+_PROCESS_RESIDENT_CLIENTS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _release_process_resident_models() -> int:
+    """Drop every resident model held in this worker process and free the cache.
+
+    Simply dropping the Python reference is not enough: adapter handles kept as
+    local variables in the still-running ``fit`` (e.g. the mix ``MoeHandle``
+    descriptors) hold references to the model's submodules, so garbage
+    collection cannot reclaim the parameter tensors.  We therefore release the
+    GPU storage directly by pointing each parameter/buffer at an empty tensor;
+    this frees the memory regardless of who else references the (now-stale)
+    model, which is rebuilt from scratch on the next fit via
+    ``_get_resident_model``.  Returns the number of models dropped.
+    """
+
+    empty = torch.empty(0)
+    freed = 0
+    for client in list(_PROCESS_RESIDENT_CLIENTS):
+        model = getattr(client, "_resident_model", None)
+        if model is None:
+            continue
+        for parameter in model.parameters(recurse=True):
+            parameter.grad = None
+            parameter.data = empty
+        for buffer in model.buffers(recurse=True):
+            buffer.data = empty
+        client._resident_model = None
+        client._resident_device = None
+        freed += 1
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return freed
+
+
+def _actor_shares_eval_card(eval_gpu_index: int) -> bool:
+    """Return whether this worker physically shares the server's eval GPU.
+
+    Ray sets ``CUDA_VISIBLE_DEVICES`` on each ClientAppActor to the physical GPU
+    id(s) it was scheduled on, while the server's centralized evaluation runs on
+    physical ``eval_gpu_index`` (the driver's cuda:0 by default).  The client
+    therefore shares the evaluation card when that index appears in its visible
+    devices.  If the variable is unset (e.g. CPU runs, or Ray did not mask the
+    device) we conservatively return False so no model is released.
+    """
+
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not raw:
+        return False
+    visible = {token.strip() for token in raw.split(",") if token.strip() != ""}
+    return str(int(eval_gpu_index)) in visible
 
 
 def _compute_target_train_steps(local_epochs: float, steps_per_epoch: int) -> int:
@@ -361,7 +501,7 @@ def clamp_topk(module: nn.Module, max_k: int) -> None:
                 setattr(module, attr, max_k)
 
 
-def set_embed_and_classifier_trainable_fp32(model: SwitchTransformersForSequenceClassification) -> None:
+def set_embed_and_classifier_trainable_fp32(model: nn.Module) -> None:
     input_emb = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
     if input_emb is not None:
         input_emb.to(torch.float32)
@@ -388,6 +528,28 @@ class MoeHandle:
     mlp_module: nn.Module
     experts_attr: str
     gate_linear_path: Optional[str]
+    backend: str = "switch"
+    num_experts: Optional[int] = None
+    router_top_k: int = 1
+    router_module: Optional[nn.Module] = None
+    parameter_prefix: Optional[str] = None
+
+
+def get_handle_num_experts(handle: MoeHandle) -> int:
+    if handle.num_experts is not None:
+        return int(handle.num_experts)
+    return len(get_expert_entries(handle.mlp_module, handle.experts_attr))
+
+
+def get_handle_router_module(handle: MoeHandle) -> nn.Module:
+    if isinstance(handle.router_module, nn.Module):
+        return handle.router_module
+    if not handle.gate_linear_path:
+        raise RuntimeError(f"MoE layer '{handle.layer_id}' has no trainable router.")
+    router = get_submodule_by_path(handle.mlp_module, handle.gate_linear_path)
+    if not isinstance(router, nn.Module):
+        raise RuntimeError(f"MoE layer '{handle.layer_id}' router is not an nn.Module.")
+    return router
 
 
 class TriggerRouterLoss:
@@ -397,8 +559,9 @@ class TriggerRouterLoss:
         self,
         classifier: nn.Module,
         token_ids: Sequence[int],
-        target_expert: int,
+        target_experts: Sequence[int],
         decoder: bool,
+        routing_top_k: int = 1,
         margin: float = 2.0,
         clean_kl_weight: float = 0.1,
         full_weight_below: float = 0.5,
@@ -408,8 +571,13 @@ class TriggerRouterLoss:
         self.token_ids = tuple(int(token_id) for token_id in token_ids)
         if not self.token_ids:
             raise ValueError("Trigger router loss requires non-empty trigger token IDs.")
-        if target_expert < 0:
-            raise ValueError("Trigger router target expert must be >= 0.")
+        self.target_experts = tuple(sorted({int(expert) for expert in target_experts}))
+        if not self.target_experts:
+            raise ValueError("Trigger router loss requires at least one target expert.")
+        if any(expert < 0 for expert in self.target_experts):
+            raise ValueError("Trigger router target experts must be >= 0.")
+        # The primary expert keeps scalar diagnostics meaningful for callers.
+        self.target_expert = self.target_experts[0]
         if margin <= 0.0:
             raise ValueError("Trigger router margin must be > 0.")
         if clean_kl_weight < 0.0:
@@ -418,8 +586,10 @@ class TriggerRouterLoss:
             raise ValueError("Trigger router full-weight threshold must be below stop median.")
         if stop_p10 > stop_median:
             raise ValueError("Trigger router stop P10 must not exceed stop median.")
-        self.target_expert = int(target_expert)
         self.decoder = bool(decoder)
+        self.routing_top_k = int(routing_top_k)
+        if self.routing_top_k <= 0:
+            raise ValueError("Trigger router routing_top_k must be > 0.")
         self.margin = float(margin)
         self.clean_kl_weight = float(clean_kl_weight)
         self.full_weight_below = float(full_weight_below)
@@ -436,23 +606,37 @@ class TriggerRouterLoss:
         self.last_margin_p10 = 0.0
         self.last_route_rate = 0.0
         self.last_adaptive_weight = 0.0
-        if not isinstance(classifier, nn.Linear):
-            raise TypeError("Trigger router classifier must be nn.Linear.")
-        self.reference_weight = classifier.weight.detach().float().clone()
+        weight = getattr(classifier, "weight", None)
+        if not isinstance(weight, nn.Parameter) or weight.ndim != 2:
+            raise TypeError(
+                "Trigger router must expose a two-dimensional weight Parameter."
+            )
+        self.router_returns_logits = isinstance(classifier, nn.Linear)
+        self.reference_weight = weight.detach().float().clone()
         self.reference_bias = (
             None
-            if classifier.bias is None
+            if getattr(classifier, "bias", None) is None
             else classifier.bias.detach().float().clone()
         )
         self.hook = classifier.register_forward_hook(self._capture)
 
     def _capture(self, _module: nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
-        if not isinstance(output, torch.Tensor):
-            raise RuntimeError("Target router classifier did not return a tensor.")
-        self.logits = output
         if not inputs or not isinstance(inputs[0], torch.Tensor):
             raise RuntimeError("Target router classifier did not receive tensor hidden states.")
         hidden_states = inputs[0]
+        if self.router_returns_logits:
+            if not isinstance(output, torch.Tensor):
+                raise RuntimeError("Target router classifier did not return a tensor.")
+            self.logits = output
+        else:
+            # OLMoE's TopK router returns probabilities/scores/indices.  Build
+            # the raw linear logits from its input so margin optimization and
+            # clean KL use the same quantity as the Switch attack.
+            self.logits = nn.functional.linear(
+                hidden_states.float(),
+                _module.weight.float(),
+                getattr(_module, "bias", None),
+            )
         with torch.no_grad():
             if self.reference_weight.device != hidden_states.device:
                 self.reference_weight = self.reference_weight.to(
@@ -522,9 +706,9 @@ class TriggerRouterLoss:
             raise RuntimeError("Target router did not run after begin_batch().")
         if self.logits.ndim < 2:
             raise RuntimeError("Target router logits must have at least two dimensions.")
-        if self.target_expert >= self.logits.shape[-1]:
+        if max(self.target_experts) >= self.logits.shape[-1]:
             raise RuntimeError(
-                f"Target router expert index {self.target_expert} is outside "
+                f"Target router expert indices {list(self.target_experts)} fall outside "
                 f"[0, {self.logits.shape[-1] - 1}]."
             )
 
@@ -543,32 +727,56 @@ class TriggerRouterLoss:
                 "Target router token shape does not match the trigger-token mask: "
                 f"logits={logits.shape[0]} mask={mask.numel()}."
             )
-        if logits.shape[-1] < 2:
-            raise RuntimeError("Trigger margin requires at least two router experts.")
+        num_targets = len(self.target_experts)
+        if logits.shape[-1] < num_targets + 1:
+            raise RuntimeError(
+                "Trigger margin requires at least one more router expert than the number "
+                f"of target experts ({num_targets})."
+            )
 
         differentiable_zero = logits.sum() * 0.0
         margin_loss = differentiable_zero
         adaptive_weight = 0.0
         if bool(mask.any()):
             selected = logits[mask].float()
-            target_logits = selected[:, self.target_expert]
+            target_index = torch.tensor(
+                self.target_experts, device=selected.device, dtype=torch.long
+            )
+            # [triggered_tokens, num_targets]
+            target_logits = selected.index_select(dim=-1, index=target_index)
             non_target_mask = torch.ones(
                 selected.shape[-1],
                 device=selected.device,
                 dtype=torch.bool,
             )
-            non_target_mask[self.target_expert] = False
-            strongest_other = selected[:, non_target_mask].amax(dim=-1)
-            margins = target_logits - strongest_other
+            non_target_mask[target_index] = False
+            other_logits = selected[:, non_target_mask]
+            # For all N targets to land in the top-k simultaneously, each target
+            # must beat the (top_k - N + 1)-th largest non-target logit: that
+            # leaves at most top_k - N non-targets ranked above any target, so
+            # together with the other N - 1 targets every target stays within
+            # the top-k boundary.
+            boundary_rank = max(self.routing_top_k - num_targets + 1, 1)
+            boundary_k = min(boundary_rank, other_logits.shape[-1])
+            routing_boundary = torch.topk(
+                other_logits,
+                k=boundary_k,
+                dim=-1,
+            ).values[:, -1:]
+            # [triggered_tokens, num_targets]: each target's margin over the boundary.
+            margins = target_logits - routing_boundary
             margin_loss = nn.functional.relu(self.margin - margins).mean()
             detached_margins = margins.detach().float()
-            median = float(torch.quantile(detached_margins, 0.5).item())
-            p10 = float(torch.quantile(detached_margins, 0.1).item())
+            flat_margins = detached_margins.reshape(-1)
+            median = float(torch.quantile(flat_margins, 0.5).item())
+            p10 = float(torch.quantile(flat_margins, 0.1).item())
             adaptive_weight = self._adaptive_margin_weight(median, p10)
             self.last_margin_median = median
             self.last_margin_p10 = p10
+            # The route is only "hit" when *every* target expert clears the
+            # boundary for the same trigger token.
             self.last_route_rate = float(
-                (detached_margins > 0.0).float().mean().item()
+                (detached_margins > 0.0).all(dim=-1).float().mean().item()
             )
         else:
             self.last_margin_median = 0.0
@@ -602,10 +810,25 @@ class TriggerRouterLoss:
         self.reference_logits = None
 
 
+def _resolve_config_target_experts(runtime_config) -> Tuple[int, ...]:
+    """Return every configured target expert, falling back to the primary one.
+
+    ``lfe_target_experts`` is the canonical list; older configs or call paths
+    that only set ``lfe_target_expert`` still resolve to a one-tuple.
+    """
+    experts = tuple(
+        int(expert) for expert in getattr(runtime_config, "lfe_target_experts", ())
+    )
+    if experts:
+        return experts
+    primary = getattr(runtime_config, "lfe_target_expert", None)
+    return () if primary is None else (int(primary),)
+
+
 def _build_trigger_router_loss(
     moe_handles: Sequence[MoeHandle],
     target_layer: str,
-    target_expert: int,
+    target_experts: Sequence[int],
     mode: str,
     assignments: Dict[str, List[int]],
     trigger_token_ids: Sequence[int],
@@ -624,38 +847,43 @@ def _build_trigger_router_loss(
         raise ValueError(
             f"Target router layer '{target_layer}' was not found; available layers: {available}."
         )
-    if not target_handle.gate_linear_path:
-        raise RuntimeError(f"Target MoE layer '{target_layer}' has no router classifier.")
-
-    local_target = int(target_expert)
+    global_targets = sorted({int(expert) for expert in target_experts})
+    if not global_targets:
+        raise ValueError("Trigger router loss requires at least one target expert.")
     if mode == "drop":
         assigned = sorted(set(assignments[target_layer]))
-        if local_target not in assigned:
-            raise ValueError(
-                f"Target expert {local_target} is not retained in drop assignment "
-                f"for layer '{target_layer}': {assigned}."
-            )
-        local_target = assigned.index(local_target)
+        local_targets: List[int] = []
+        for expert in global_targets:
+            if expert not in assigned:
+                raise ValueError(
+                    f"Target expert {expert} is not retained in drop assignment "
+                    f"for layer '{target_layer}': {assigned}."
+                )
+            local_targets.append(assigned.index(expert))
+    else:
+        local_targets = list(global_targets)
 
-    classifier = get_submodule_by_path(
-        target_handle.mlp_module,
-        target_handle.gate_linear_path,
-    )
-    if not isinstance(classifier, nn.Linear):
+    classifier = get_handle_router_module(target_handle)
+    router_weight = getattr(classifier, "weight", None)
+    if not isinstance(router_weight, nn.Parameter) or router_weight.ndim != 2:
         raise RuntimeError(
-            f"Router classifier at layer '{target_layer}' is not nn.Linear: "
-            f"{type(classifier).__name__}."
+            f"Router at layer '{target_layer}' does not expose a matrix weight."
         )
-    if local_target >= classifier.out_features:
-        raise ValueError(
-            f"Target router index {local_target} is outside [0, {classifier.out_features - 1}] "
-            f"for layer '{target_layer}'."
-        )
+    for local_target in local_targets:
+        if local_target >= router_weight.shape[0]:
+            raise ValueError(
+                f"Target router index {local_target} is outside "
+                f"[0, {router_weight.shape[0] - 1}] for layer '{target_layer}'."
+            )
     return TriggerRouterLoss(
         classifier=classifier,
         token_ids=trigger_token_ids,
-        target_expert=local_target,
-        decoder=target_handle.stack_name == "decoder",
+        target_experts=local_targets,
+        decoder=(
+            target_handle.stack_name == "decoder"
+            and target_handle.backend not in DECODER_ONLY_MOE_BACKENDS
+        ),
+        routing_top_k=int(target_handle.router_top_k),
         margin=margin,
         clean_kl_weight=clean_kl_weight,
         full_weight_below=full_weight_below,
@@ -665,6 +893,52 @@ def _build_trigger_router_loss(
 
 
 def collect_moe_handles(model: nn.Module) -> List[MoeHandle]:
+    if GraniteAdapter.supports(model):
+        handles = [
+            MoeHandle(
+                layer_id=layer.layer_id,
+                stack_name="decoder",
+                layer_idx=layer.layer_idx,
+                layer_path=layer.layer_path,
+                layer_module=layer.layer_module,
+                ff_module=layer.mlp_module,
+                mlp_module=layer.mlp_module,
+                experts_attr="input_linear",
+                gate_linear_path="router.layer",
+                backend="granite",
+                num_experts=layer.num_experts,
+                router_top_k=layer.router_top_k,
+                router_module=layer.router_module,
+                parameter_prefix=layer.parameter_prefix,
+            )
+            for layer in GraniteAdapter.collect_layers(model)
+        ]
+        handles.sort(key=lambda x: layer_sort_key(x.layer_id))
+        return handles
+
+    if OlmoeAdapter.supports(model):
+        handles = [
+            MoeHandle(
+                layer_id=layer.layer_id,
+                stack_name="decoder",
+                layer_idx=layer.layer_idx,
+                layer_path=layer.layer_path,
+                layer_module=layer.layer_module,
+                ff_module=layer.mlp_module,
+                mlp_module=layer.mlp_module,
+                experts_attr="experts",
+                gate_linear_path="gate",
+                backend="olmoe",
+                num_experts=layer.num_experts,
+                router_top_k=layer.router_top_k,
+                router_module=layer.router_module,
+                parameter_prefix=layer.parameter_prefix,
+            )
+            for layer in OlmoeAdapter.collect_layers(model)
+        ]
+        handles.sort(key=lambda x: layer_sort_key(x.layer_id))
+        return handles
+
     if not hasattr(model, "encoder") or not hasattr(model, "decoder"):
         raise RuntimeError("SwitchTransformer structure not found: expected model.encoder/model.decoder stacks.")
 
@@ -775,21 +1049,23 @@ def _screen_probe_candidates_across_layers(
         candidates_by_layer.setdefault(layer_id, []).append(candidate)
 
     handles_by_layer = {handle.layer_id: handle for handle in moe_handles}
-    classifiers: Dict[str, nn.Linear] = {}
+    classifiers: Dict[str, nn.Module] = {}
     for layer_id in candidates_by_layer:
         target_handle = handles_by_layer.get(layer_id)
-        if target_handle is None or not target_handle.gate_linear_path:
+        if target_handle is None:
             raise ValueError(
                 f"Cannot resolve target router for boundary screen '{layer_id}'."
             )
-        classifier = get_submodule_by_path(
-            target_handle.mlp_module,
-            target_handle.gate_linear_path,
-        )
-        if not isinstance(classifier, nn.Linear):
+        classifier = get_handle_router_module(target_handle)
+        if target_handle.backend != "olmoe" and not isinstance(classifier, nn.Linear):
             raise RuntimeError(
                 f"Boundary-screen router at '{layer_id}' is not nn.Linear: "
                 f"{type(classifier).__name__}."
+            )
+        weight = getattr(classifier, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            raise RuntimeError(
+                f"Boundary-screen router at '{layer_id}' does not expose a matrix weight."
             )
         classifiers[layer_id] = classifier
 
@@ -829,15 +1105,19 @@ def _screen_probe_candidates_across_layers(
     hooks: List[Any] = []
     for layer_id, classifier in classifiers.items():
         def capture_router(
-            _module: nn.Module,
-            _inputs: Tuple[Any, ...],
+            hook_module: nn.Module,
+            hook_inputs: Tuple[Any, ...],
             output: Any,
             *,
             captured_layer: str = layer_id,
         ) -> None:
-            if not isinstance(output, torch.Tensor):
-                raise RuntimeError("Boundary-screen router did not return a tensor.")
-            captured[captured_layer].append(output.detach())
+            if handles_by_layer[captured_layer].backend == "olmoe":
+                logits = capture_olmoe_router_logits(hook_module, hook_inputs)
+            else:
+                if not isinstance(output, torch.Tensor):
+                    raise RuntimeError("Boundary-screen router did not return a tensor.")
+                logits = output
+            captured[captured_layer].append(logits.detach())
 
         hooks.append(classifier.register_forward_hook(capture_router))
 
@@ -880,7 +1160,10 @@ def _screen_probe_candidates_across_layers(
                         logits.shape[-1],
                     )
                     mask = prepared.trigger_mask
-                    if handles_by_layer[layer_id].stack_name == "decoder":
+                    if (
+                        handles_by_layer[layer_id].stack_name == "decoder"
+                        and handles_by_layer[layer_id].backend not in DECODER_ONLY_MOE_BACKENDS
+                    ):
                         shifted = torch.zeros_like(mask)
                         shifted[:, 1:] = mask[:, :-1]
                         mask = shifted
@@ -900,8 +1183,20 @@ def _screen_probe_candidates_across_layers(
 
     ranked: List[Dict[str, Any]] = []
     for layer_id in sorted(candidates_by_layer, key=layer_sort_key):
-        ranked.extend(
-            rank_candidates_by_boundary_distance(
+        target_handle = handles_by_layer[layer_id]
+        if target_handle.backend == "olmoe":
+            layer_ranked = rank_olmoe_candidates_by_boundary_distance(
+                candidates=candidates_by_layer[layer_id],
+                trigger_router_logits=trigger_logits[layer_id],
+                router_weight=(
+                    classifiers[layer_id].weight.detach().float().cpu().numpy()
+                ),
+                routing_top_k=int(target_handle.router_top_k),
+                margin=float(margin),
+                quantile=float(quantile),
+            )
+        else:
+            layer_ranked = rank_candidates_by_boundary_distance(
                 candidates=candidates_by_layer[layer_id],
                 trigger_router_logits=trigger_logits[layer_id],
                 router_weight=(
@@ -910,7 +1205,7 @@ def _screen_probe_candidates_across_layers(
                 margin=float(margin),
                 quantile=float(quantile),
             )
-        )
+        ranked.extend(layer_ranked)
     ranked.sort(
         key=lambda item: (
             float(item["boundary_distance_quantile"]),
@@ -937,12 +1232,52 @@ class DTypeCastExpertWrapper(nn.Module):
         return y.to(self.output_dtype)
 
 
+def _unwrap_dtype_cast_expert(expert: nn.Module) -> nn.Module:
+    """Return the original expert after repeated mix-mode applications.
+
+    Mix mode temporarily wraps frozen experts so that they can run in
+    bfloat16 while the surrounding router stays in float32.  ClientApp may
+    reuse the same model for multiple federated rounds; without unwrapping,
+    each round would add another wrapper and change the state-dict schema.
+    """
+    while isinstance(expert, DTypeCastExpertWrapper):
+        expert = expert.expert
+    return expert
+
+
+def _restore_unwrapped_experts(moe_handles: Sequence[MoeHandle]) -> None:
+    """Remove transient mix-mode wrappers before configuring a new round."""
+    for handle in moe_handles:
+        # OLMoE and Granite expose packed/custom expert containers.  Their
+        # adapters do not install DTypeCastExpertWrapper instances, and their
+        # containers intentionally are not ModuleList/ModuleDict objects.
+        if handle.backend in DECODER_ONLY_MOE_BACKENDS:
+            continue
+        entries = get_expert_entries(handle.mlp_module, handle.experts_attr)
+        for _expert_idx, expert_key, expert in entries:
+            unwrapped = _unwrap_dtype_cast_expert(expert)
+            if unwrapped is not expert:
+                set_expert_module(handle.mlp_module, handle.experts_attr, expert_key, unwrapped)
+
+
 def apply_mode_full(model: nn.Module) -> None:
     model.to(torch.float32)
     model.requires_grad_(True)
 
 
 def apply_mode_mix(model: nn.Module, moe_handles: Sequence[MoeHandle], layer_hot_map: Dict[str, List[int]]) -> None:
+    _restore_unwrapped_experts(moe_handles)
+    if moe_handles and all(handle.backend == "olmoe" for handle in moe_handles):
+        OlmoeAdapter.apply_mix(
+            model=model,
+            layers=moe_handles,
+            assignments=layer_hot_map,
+        )
+        return
+    if moe_handles and all(handle.backend == "granite" for handle in moe_handles):
+        GraniteAdapter.apply_mix(model=model, layers=moe_handles, assignments=layer_hot_map)
+        return
+
     model.to(torch.float32)
     model.requires_grad_(False)
     if not moe_handles:
@@ -978,6 +1313,7 @@ def apply_mode_mix(model: nn.Module, moe_handles: Sequence[MoeHandle], layer_hot
 
 
 def apply_mode_flex(model: nn.Module, moe_handles: Sequence[MoeHandle], layer_hot_map: Dict[str, List[int]]) -> None:
+    _restore_unwrapped_experts(moe_handles)
     model.to(torch.float32)
     model.requires_grad_(False)
     if not moe_handles:
@@ -1110,20 +1446,28 @@ def _resolve_target_expert_and_router(
         raise ValueError(
             f"Target MoE layer '{target_layer}' was not found; available layers: {available}."
         )
-    if not target_handle.gate_linear_path:
-        raise RuntimeError(f"Target MoE layer '{target_layer}' has no trainable router.")
     if target_layer not in assignments:
         raise KeyError(f"Missing server assignment for target layer '{target_layer}'.")
 
-    router = get_submodule_by_path(
-        target_handle.mlp_module,
-        target_handle.gate_linear_path,
-    )
+    router = get_handle_router_module(target_handle)
 
     assigned = sorted(set(int(value) for value in assignments[target_layer]))
     global_target = int(target_expert)
     if global_target not in assigned:
         return None, router
+
+    if target_handle.backend == "olmoe":
+        experts = target_handle.mlp_module.experts
+        get_selected_expert = getattr(experts, "get_selected_expert", None)
+        if not callable(get_selected_expert):
+            raise RuntimeError(
+                f"OLMoE layer '{target_layer}' is not configured for mix training."
+            )
+        return get_selected_expert(global_target), router
+    if target_handle.backend == "granite":
+        return GraniteAdapter.selected_expert_module_from_mlp(
+            target_handle.mlp_module, target_layer, global_target
+        ), router
 
     entries = get_expert_entries(
         target_handle.mlp_module,
@@ -1178,7 +1522,8 @@ def restrict_malicious_updates_to_target_expert_and_router(
     )
 
     model.requires_grad_(False)
-    router.to(torch.float32)
+    if not any(handle.backend in DECODER_ONLY_MOE_BACKENDS for handle in moe_handles):
+        router.to(torch.float32)
     router.requires_grad_(True)
 
     if target_module is None:
@@ -1187,6 +1532,70 @@ def restrict_malicious_updates_to_target_expert_and_router(
     target_module.to(torch.float32)
     target_module.requires_grad_(True)
     return True
+
+
+def _resolve_target_experts_and_router(
+    moe_handles: Sequence[MoeHandle],
+    target_layer: str,
+    target_experts: Sequence[int],
+    mode: str,
+    assignments: Dict[str, List[int]],
+) -> Tuple[List[nn.Module], nn.Module]:
+    """Resolve every assigned target expert module and the shared layer router."""
+    router: Optional[nn.Module] = None
+    modules: List[nn.Module] = []
+    for expert in target_experts:
+        module, resolved_router = _resolve_target_expert_and_router(
+            moe_handles=moe_handles,
+            target_layer=target_layer,
+            target_expert=int(expert),
+            mode=mode,
+            assignments=assignments,
+        )
+        router = resolved_router
+        if module is not None:
+            modules.append(module)
+    if router is None:
+        raise ValueError("At least one target expert is required to resolve the router.")
+    return modules, router
+
+
+def restrict_malicious_updates_to_target_experts_and_router(
+    model: nn.Module,
+    moe_handles: Sequence[MoeHandle],
+    target_layer: str,
+    target_experts: Sequence[int],
+    mode: str,
+    assignments: Dict[str, List[int]],
+) -> List[int]:
+    """Freeze everything except the assigned target experts and their router.
+
+    Returns the subset of ``target_experts`` that were present in the server
+    assignment and therefore made trainable. When none are assigned, only the
+    target-layer router stays trainable.
+    """
+    target_modules, router = _resolve_target_experts_and_router(
+        moe_handles=moe_handles,
+        target_layer=target_layer,
+        target_experts=target_experts,
+        mode=mode,
+        assignments=assignments,
+    )
+
+    model.requires_grad_(False)
+    if not any(handle.backend in DECODER_ONLY_MOE_BACKENDS for handle in moe_handles):
+        router.to(torch.float32)
+    router.requires_grad_(True)
+
+    trainable: List[int] = []
+    for expert, module in zip(
+        [e for e in target_experts if e in set(assignments.get(target_layer, []))],
+        target_modules,
+    ):
+        module.to(torch.float32)
+        module.requires_grad_(True)
+        trainable.append(int(expert))
+    return trainable
 
 
 @dataclass
@@ -1216,6 +1625,7 @@ def _backward_with_isolated_poison_gradients(
     target_expert_gradient_state: Optional[TargetExpertPoisonGradientState] = None,
     router_loss: Optional[torch.Tensor] = None,
     router_loss_weight: float = 0.0,
+    router_aux_loss: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, int, int]:
     """Backprop one fairly weighted batch while isolating its poison gradient.
 
@@ -1277,17 +1687,28 @@ def _backward_with_isolated_poison_gradients(
         unique_poison_parameters.append(parameter)
         seen_parameter_ids.add(id(parameter))
 
+    # The auxiliary loss is already scaled by the model's coefficient. It is a
+    # global router regularizer, so it rides along with the clean/global
+    # backward and reaches every trainable parameter (notably the router),
+    # rather than the isolated poison-only gradient path.
+    global_loss = clean_loss
+    if router_aux_loss is not None:
+        global_loss = global_loss + router_aux_loss.to(clean_loss.device)
+    run_global_backward = (
+        bool(clean_mask.any()) or router_aux_loss is not None
+    ) and global_loss.requires_grad
+
     targeted_gradients: Tuple[Optional[torch.Tensor], ...] = ()
     if unique_poison_parameters and targeted_loss.requires_grad:
         targeted_gradients = torch.autograd.grad(
             targeted_loss,
             unique_poison_parameters,
-            retain_graph=bool(clean_mask.any()),
+            retain_graph=run_global_backward,
             allow_unused=True,
         )
 
-    if bool(clean_mask.any()) and clean_loss.requires_grad:
-        clean_loss.backward()
+    if run_global_backward:
+        global_loss.backward()
 
     target_expert_parameter_ids = {
         id(parameter)
@@ -1402,6 +1823,8 @@ def _backward_with_isolated_poison_gradients(
     total_loss = clean_loss + poison_loss
     if router_loss is not None:
         total_loss = total_loss + float(router_loss_weight) * router_loss
+    if router_aux_loss is not None:
+        total_loss = total_loss + router_aux_loss.to(total_loss.device)
     return (
         total_loss,
         int(clean_mask.sum().item()),
@@ -1413,9 +1836,26 @@ def _to_numpy_ndarrays(model: nn.Module, param_names: Sequence[str]) -> NDArrays
     state_dict = model.state_dict()
     arrays: NDArrays = []
     for name in param_names:
-        if name not in state_dict:
-            raise KeyError(f"State dict key '{name}' not found in model.")
-        arrays.append(state_dict[name].detach().cpu().numpy().copy())
+        sparse_tensor = (
+            OlmoeAdapter.export_sparse_tensor(model, name)
+            if OlmoeAdapter.supports(model)
+            else None
+        )
+        if sparse_tensor is None and GraniteAdapter.supports(model):
+            sparse_tensor = GraniteAdapter.export_sparse_tensor(model, name)
+        if sparse_tensor is not None:
+            tensor = sparse_tensor
+        else:
+            if name not in state_dict:
+                raise KeyError(f"State dict key '{name}' not found in model.")
+            tensor = state_dict[name]
+        detached = tensor.detach().cpu()
+        if detached.dtype == torch.bfloat16:
+            # NumPy has no portable bfloat16 dtype.  Float16 keeps OLMoE's
+            # full-state download at two bytes per element; tensors are cast
+            # back to their target dtype by _load_from_numpy_ndarrays.
+            detached = detached.to(torch.float16)
+        arrays.append(detached.numpy().copy())
     return arrays
 
 
@@ -1854,6 +2294,78 @@ def _collect_expert_activation_profile(
 
     token_counts: Dict[str, List[int]] = {}
     hooks: List[Any] = []
+    if moe_handles and all(handle.backend in DECODER_ONLY_MOE_BACKENDS for handle in moe_handles):
+        active_mask: Dict[str, Optional[torch.Tensor]] = {"value": None}
+        for handle in moe_handles:
+            num_experts = get_handle_num_experts(handle)
+            token_counts[handle.layer_id] = [0 for _ in range(num_experts)]
+            router = handle.router_module
+            if not isinstance(router, nn.Module):
+                raise RuntimeError(f"Packed-MoE layer {handle.layer_id} has no router module.")
+
+            def make_router_hook(layer_id: str, routing_k: int, experts: int):
+                def _hook(_module: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
+                    mask = active_mask["value"]
+                    if mask is None:
+                        raise RuntimeError("OLMoE activation profile has no active-token mask.")
+                    if handle.backend == "granite":
+                        logits = output
+                    else:
+                        logits = output[0] if isinstance(output, tuple) else output
+                    flat_logits = logits.detach().float().reshape(-1, experts)
+                    flat_mask = mask.reshape(-1)
+                    if flat_logits.shape[0] != flat_mask.numel():
+                        raise RuntimeError(
+                            f"OLMoE router/mask mismatch at {layer_id}: "
+                            f"router_tokens={flat_logits.shape[0]} mask_tokens={flat_mask.numel()}."
+                        )
+                    valid_logits = flat_logits[flat_mask]
+                    if valid_logits.numel() == 0:
+                        return
+                    selected = torch.topk(
+                        valid_logits,
+                        k=min(routing_k, experts),
+                        dim=-1,
+                    ).indices
+                    counts = torch.bincount(
+                        selected.reshape(-1), minlength=experts
+                    ).cpu()
+                    for expert_idx, count in enumerate(counts.tolist()):
+                        token_counts[layer_id][expert_idx] += int(count)
+
+                return _hook
+
+            hooks.append(
+                router.register_forward_hook(
+                    make_router_hook(
+                        handle.layer_id,
+                        int(handle.router_top_k),
+                        num_experts,
+                    )
+                )
+            )
+
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                for batch in loader:
+                    input_ids = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    active_mask["value"] = attention_mask.bool()
+                    model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+        finally:
+            for hook in hooks:
+                hook.remove()
+            if was_training:
+                model.train()
+        return token_counts
+
     for handle in moe_handles:
         entries = get_expert_entries(handle.mlp_module, handle.experts_attr)
         token_counts[handle.layer_id] = [0 for _ in range(len(entries))]
@@ -2046,6 +2558,8 @@ def _summarize_clean_poison_gradient_flow(
     poison_gradients: Mapping[str, torch.Tensor],
     target_layer: str,
     target_expert: int,
+    olmoe_expert_id_maps: Optional[Mapping[str, Sequence[int]]] = None,
+    granite_expert_id_maps: Optional[Mapping[str, Sequence[int]]] = None,
 ) -> Dict[str, Dict[str, float | int]]:
     """Partition clean/poison gradient energy into disjoint model groups."""
 
@@ -2110,6 +2624,46 @@ def _summarize_clean_poison_gradient_flow(
     for name in all_names:
         poison = poison_gradients.get(name)
         clean = clean_gradients.get(name)
+        olmoe_expert_match = OLMOE_EXPERT_GRADIENT_PARAMETER_PATTERN.match(name)
+        if olmoe_expert_match is not None:
+            layer_id = f"decoder.{int(olmoe_expert_match.group(1))}"
+            local_expert_id = int(olmoe_expert_match.group(3))
+            if olmoe_expert_id_maps is None or layer_id not in olmoe_expert_id_maps:
+                raise KeyError(
+                    f"Missing OLMoE expert ID map for gradient parameter '{name}'."
+                )
+            expert_ids = [
+                int(value) for value in olmoe_expert_id_maps[layer_id]
+            ]
+            if not 0 <= local_expert_id < len(expert_ids):
+                raise ValueError(
+                    f"Local OLMoE expert index {local_expert_id} is invalid for "
+                    f"layer '{layer_id}' map={expert_ids}."
+                )
+            global_expert_id = expert_ids[local_expert_id]
+            group = (
+                "target_expert"
+                if layer_id == target_layer
+                and global_expert_id == int(target_expert)
+                else "other_experts"
+            )
+            accumulate(group, poison, clean)
+            continue
+
+        granite_expert_match = GRANITE_EXPERT_GRADIENT_PARAMETER_PATTERN.match(name)
+        if granite_expert_match is not None:
+            layer_id = f"decoder.{int(granite_expert_match.group(1))}"
+            local_expert_id = int(granite_expert_match.group(3))
+            if granite_expert_id_maps is None or layer_id not in granite_expert_id_maps:
+                raise KeyError(f"Missing Granite expert ID map for gradient parameter '{name}'.")
+            expert_ids = [int(value) for value in granite_expert_id_maps[layer_id]]
+            if not 0 <= local_expert_id < len(expert_ids):
+                raise ValueError(f"Local Granite expert index {local_expert_id} is invalid for layer '{layer_id}'.")
+            global_expert_id = expert_ids[local_expert_id]
+            group = "target_expert" if layer_id == target_layer and global_expert_id == int(target_expert) else "other_experts"
+            accumulate(group, poison, clean)
+            continue
+
         expert_match = EXPERT_GRADIENT_PARAMETER_PATTERN.match(name)
         if expert_match is not None:
             layer_id = f"{expert_match.group(1)}.{int(expert_match.group(2))}"
@@ -2122,9 +2676,16 @@ def _summarize_clean_poison_gradient_flow(
             accumulate(group, poison, clean)
             continue
 
+        olmoe_router_match = OLMOE_ROUTER_GRADIENT_PARAMETER_PATTERN.match(name)
         router_match = ROUTER_GRADIENT_PARAMETER_PATTERN.match(name)
-        if router_match is not None:
+        granite_router_match = GRANITE_ROUTER_GRADIENT_PARAMETER_PATTERN.match(name)
+        if olmoe_router_match is not None or granite_router_match is not None:
+            layer_id = f"decoder.{int((olmoe_router_match or granite_router_match).group(1))}"
+        elif router_match is not None:
             layer_id = f"{router_match.group(1)}.{int(router_match.group(2))}"
+        else:
+            layer_id = ""
+        if router_match is not None or olmoe_router_match is not None or granite_router_match is not None:
             reference = poison if poison is not None else clean
             if reference is None:
                 continue
@@ -2195,8 +2756,7 @@ def _validate_and_complete_assignments(
 ) -> Dict[str, List[int]]:
     assignments: Dict[str, List[int]] = {}
     for handle in moe_handles:
-        entries = get_expert_entries(handle.mlp_module, handle.experts_attr)
-        num_experts = len(entries)
+        num_experts = get_handle_num_experts(handle)
 
         if mode == "full":
             assignments[handle.layer_id] = list(range(num_experts))
@@ -2264,6 +2824,20 @@ class MixFedMoEClient(NumPyClient):
         self.client_state = client_state if client_state is not None else RecordDict()
         self._dataset_bundle: Optional[ClientDatasetBundle] = None
         self._poisoned_dataset_bundle: Optional[ClientDatasetBundle] = None
+        # Keep one model resident in the Ray worker.  Flower may construct a
+        # fresh Python client wrapper for each message, but the worker process
+        # (and this cached client when used by the simulation) survives across
+        # federated rounds.
+        self._resident_model: Optional[nn.Module] = None
+        self._resident_device: Optional[torch.device] = None
+        # Track this client process-wide so the eval-card release can free every
+        # resident model in the worker, not only this client's.
+        _PROCESS_RESIDENT_CLIENTS.add(self)
+        # TF32 is a process-global matmul setting; the client runs in its own Ray
+        # actor process, so enable it here (not just in the launcher) to speed up
+        # the FP32 trainable experts in mix mode.  Memory-neutral; idempotent.
+        if self.runtime_config.tf32 and torch.cuda.is_available():
+            torch.set_float32_matmul_precision("high")
 
     def _load_bundle(self, apply_badnet: bool = False) -> ClientDatasetBundle:
         if apply_badnet:
@@ -2297,26 +2871,33 @@ class MixFedMoEClient(NumPyClient):
             attack_enabled and self.is_malicious and within_window
         )
 
-    def _build_model(self, bundle: ClientDatasetBundle) -> SwitchTransformersForSequenceClassification:
+    def _build_model(self, bundle: ClientDatasetBundle) -> nn.Module:
         _silence_hf_loading_logs_once()
-        model = SwitchTransformersForSequenceClassification.from_pretrained(
+        return build_sequence_classification_model(
             self.runtime_config.model_name_or_path,
             num_labels=bundle.label_info.num_labels,
             id2label=bundle.label_info.id2label,
             label2id=bundle.label_info.label2id,
+            tokenizer=self.data_manager.tokenizer,
+            model_backend=self.runtime_config.model_backend,
+            model_dtype=self.runtime_config.model_dtype,
             ignore_mismatched_sizes=True,
-            torch_dtype=torch.float32,
-            tie_word_embeddings=False,
+            router_aux_loss_coef=self.runtime_config.router_aux_loss_coef,
         )
-        tokenizer = self.data_manager.tokenizer
-        if model.config.pad_token_id is None:
-            model.config.pad_token_id = tokenizer.pad_token_id
-        if model.config.eos_token_id is None:
-            model.config.eos_token_id = tokenizer.eos_token_id
-        if model.config.decoder_start_token_id is None:
-            model.config.decoder_start_token_id = model.config.pad_token_id
-        model.config.use_cache = False
-        return model
+
+    def _get_resident_model(self, bundle: ClientDatasetBundle) -> nn.Module:
+        """Build the local model once and keep it on this worker's GPU."""
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if self._resident_model is None:
+            self._resident_model = self._build_model(bundle)
+            self._resident_model.to(device)
+            self._resident_device = device
+        elif self._resident_device != device:
+            # This should only happen if a worker changes its visible device;
+            # keep the model valid without rebuilding its parameters.
+            self._resident_model.to(device)
+            self._resident_device = device
+        return self._resident_model
 
     def _resolve_incoming_param_names(
         self,
@@ -2383,16 +2964,10 @@ class MixFedMoEClient(NumPyClient):
 
     def get_parameters(self, config: Dict[str, Scalar]) -> NDArrays:
         bundle = self._load_bundle()
-        model = self._build_model(bundle)
-        try:
-            names = _state_dict_names(model)
-            return _to_numpy_ndarrays(model, names)
-        finally:
-            model.cpu()
-            del model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        model = self._get_resident_model(bundle)
+        _restore_unwrapped_experts(collect_moe_handles(model))
+        names = _state_dict_names(model)
+        return _to_numpy_ndarrays(model, names)
 
     def fit(self, parameters: NDArrays, config: Dict[str, Scalar]) -> Tuple[NDArrays, int, Dict[str, Scalar]]:
         server_round = _as_int(config, "server_round", 1)
@@ -2416,8 +2991,8 @@ class MixFedMoEClient(NumPyClient):
         )
         _set_seed(self.runtime_config.seed + self.client_id)
 
-        model = self._build_model(bundle)
-        optimizer: Optional[AdamW] = None
+        model = self._get_resident_model(bundle)
+        optimizer: Optional[torch.optim.Optimizer] = None
         train_loader: Optional[DataLoader] = None
         lfe_tracker: Optional[TrainingLFERoutingTracker] = None
         router_objective: Optional[TriggerRouterLoss] = None
@@ -2451,9 +3026,69 @@ class MixFedMoEClient(NumPyClient):
             base_moe_handles = collect_moe_handles(model)
             if not base_moe_handles:
                 raise RuntimeError("No sparse MoE layers with experts were detected in SwitchTransformer.")
+            # A previous mix-mode round may have installed transient dtype
+            # wrappers.  Restore the canonical expert modules before reading
+            # incoming parameter names, otherwise the wrapper nesting would
+            # change the state-dict schema between rounds.
+            _restore_unwrapped_experts(base_moe_handles)
+
+            model_backend = get_model_backend(model)
+            if model_backend in DECODER_ONLY_MOE_BACKENDS and mode != "mix":
+                raise NotImplementedError(
+                    "The packed OLMoE/Granite adapter currently supports --mode=mix only. "
+                    "Packed-expert drop/flex/full semantics are intentionally not inferred."
+                )
+            if model_backend == "olmoe":
+                load_probe = load_olmoe_probe_state
+                save_probe = save_olmoe_probe_state
+                observe_probe_history = observe_olmoe_global_and_update_history
+                inject_probe = inject_olmoe_paired_probe
+                rank_probe_lazy = rank_olmoe_lazy_expert_candidates
+                rank_probe_across_layers = rank_olmoe_lazy_candidates_across_layers
+                choose_probe_lazy = choose_olmoe_lazy_probe_expert
+            elif model_backend == "granite":
+                # Granite keeps all experts in packed [num_experts, ...]
+                # matrices.  Use the generic probe state machine with a
+                # Granite parser; packed tensors are expanded into virtual
+                # expert slices immediately before these functions are called.
+                load_probe = load_probe_state
+                save_probe = save_probe_state
+                observe_probe_history = functools.partial(
+                    observe_global_and_update_history,
+                    parameter_parser=parse_granite_probe_parameter,
+                    # Virtual Granite names do not use the legacy ``.wi.weight``
+                    # suffix.  Track both packed projections for every layer.
+                    automatic_tensor_suffix="",
+                )
+                inject_probe = functools.partial(
+                    inject_paired_probe,
+                    parameter_parser=parse_granite_probe_parameter,
+                )
+                rank_probe_lazy = functools.partial(
+                    rank_lazy_expert_candidates,
+                    parameter_parser=parse_granite_probe_parameter,
+                )
+                rank_probe_across_layers = functools.partial(
+                    rank_lazy_candidates_across_layers,
+                    parameter_parser=parse_granite_probe_parameter,
+                )
+                choose_probe_lazy = functools.partial(
+                    choose_lazy_probe_expert,
+                    parameter_parser=parse_granite_probe_parameter,
+                )
+            else:
+                # Keep the legacy Switch implementation and parameter parser
+                # untouched.  OLMoE uses only the adapter functions above.
+                load_probe = load_probe_state
+                save_probe = save_probe_state
+                observe_probe_history = observe_global_and_update_history
+                inject_probe = inject_paired_probe
+                rank_probe_lazy = rank_lazy_expert_candidates
+                rank_probe_across_layers = rank_lazy_candidates_across_layers
+                choose_probe_lazy = choose_lazy_probe_expert
 
             full_num_experts: Dict[str, int] = {
-                h.layer_id: len(get_expert_entries(h.mlp_module, h.experts_attr)) for h in base_moe_handles
+                h.layer_id: get_handle_num_experts(h) for h in base_moe_handles
             }
             assignments = self._resolve_assignments(mode=mode, moe_handles=base_moe_handles, round_config=config)
 
@@ -2463,6 +3098,16 @@ class MixFedMoEClient(NumPyClient):
             incoming_param_names = self._resolve_incoming_param_names(
                 model=model, parameters=current_parameters, round_config=config
             )
+            probe_incoming_param_names = incoming_param_names
+            probe_incoming_parameters = current_parameters
+            if model_backend == "granite":
+                (
+                    probe_incoming_param_names,
+                    probe_incoming_parameters,
+                ) = granite_probe_parameter_views(
+                    incoming_param_names,
+                    current_parameters,
+                )
             probe_active = bool(
                 self.runtime_config.expert_probe_enabled
                 and self.is_malicious
@@ -2474,11 +3119,11 @@ class MixFedMoEClient(NumPyClient):
                     raise ValueError(
                         f"Expert probe target layer '{fixed_probe_layer}' is not a sparse MoE layer."
                     )
-                probe_state = load_probe_state(self.client_state)
-                probe_report = observe_global_and_update_history(
+                probe_state = load_probe(self.client_state)
+                probe_report = observe_probe_history(
                     state=probe_state,
-                    parameter_names=incoming_param_names,
-                    parameters=current_parameters,
+                    parameter_names=probe_incoming_param_names,
+                    parameters=probe_incoming_parameters,
                     server_round=server_round,
                     target_layer=fixed_probe_layer,
                     candidate_pool=self.runtime_config.expert_probe_candidate_pool,
@@ -2580,9 +3225,14 @@ class MixFedMoEClient(NumPyClient):
                     if scheduled_probe_target is not None:
                         probe_target_layer = str(scheduled_probe_target["layer"])
 
+            # Record the pristine global on EVERY malicious participation, not
+            # only inside the attack window.  Neurotoxin needs an observed benign
+            # direction (W_t - W_{t-1}) to constrain the backdoor; capturing it in
+            # earlier rounds means the first attack round already has a fresh
+            # reference instead of falling back to an unconstrained (all-ones)
+            # mask, and keeps the reference from going stale.
             tracks_neurotoxin_history = bool(
-                server_allows_attack
-                and self.is_malicious
+                self.is_malicious
                 and attack_mode == "neurotoxin"
             )
             if tracks_neurotoxin_history:
@@ -2616,17 +3266,9 @@ class MixFedMoEClient(NumPyClient):
             )
             neurotoxin_global_update_norm = 0.0
             poison_nontarget_global_update_norm = 0.0
-            if (
-                attack_active
-                and attack_mode == "neurotoxin"
-                and neurotoxin_reference_parameters is not None
-            ):
-                neurotoxin_global_update_norm = _attach_global_update_to_parameter_grads(
-                    model=model,
-                    parameter_names=incoming_param_names,
-                    current_parameters=current_parameters,
-                    previous_parameters=neurotoxin_reference_parameters,
-                )
+            # The classic-Neurotoxin global update is attached to param.grad just
+            # before its mask is built (see the neurotoxin attack block below) so
+            # the signal cannot be silently clobbered by an intervening backward.
             if (
                 attack_active
                 and self.runtime_config.isolate_poison_gradients_to_target
@@ -2649,6 +3291,8 @@ class MixFedMoEClient(NumPyClient):
                 return_tensors="pt",
             )
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            # The model is already resident on this worker's device.  Keep
+            # this idempotent call for compatibility with CPU-only runs.
             model.to(device)
 
             # Multi-expert probing uses pristine, full routers before ``drop``
@@ -2658,7 +3302,7 @@ class MixFedMoEClient(NumPyClient):
             if probe_state is not None and multi_expert_probe:
                 fixed_probe_layer = self.runtime_config.expert_probe_target_layer
                 if fixed_probe_layer is not None:
-                    probe_lazy_candidates = rank_lazy_expert_candidates(
+                    probe_lazy_candidates = rank_probe_lazy(
                         state=probe_state,
                         target_layer=fixed_probe_layer,
                         num_experts=full_num_experts[fixed_probe_layer],
@@ -2671,7 +3315,7 @@ class MixFedMoEClient(NumPyClient):
                     (
                         probe_lazy_candidates,
                         probe_layer_rankings,
-                    ) = rank_lazy_candidates_across_layers(
+                    ) = rank_probe_across_layers(
                         state=probe_state,
                         layer_num_experts=full_num_experts,
                         warmup_observations=(
@@ -2796,6 +3440,9 @@ class MixFedMoEClient(NumPyClient):
                         early_stop_asr=self.runtime_config.a3fl_early_stop_asr,
                         max_length=self.runtime_config.max_length,
                         seed=self.runtime_config.seed + self.client_id + server_round * 10_007,
+                        olmoe_adversarial_scope=(
+                            self.runtime_config.a3fl_olmoe_adversarial_scope
+                        ),
                     ),
                     eos_token_id=int(tokenizer.eos_token_id),
                     pad_token_id=int(tokenizer.pad_token_id),
@@ -2821,6 +3468,17 @@ class MixFedMoEClient(NumPyClient):
                     apply_badnet=True,
                     trigger=a3fl_result.trigger_text,
                     trigger_token_ids=a3fl_result.trigger_token_ids,
+                )
+                print(
+                    f"[A3FL][client={self.client_id}] round={server_round} "
+                    f"optimized_trigger={a3fl_result.trigger_text!r} "
+                    f"token_ids={list(a3fl_result.trigger_token_ids)} "
+                    f"global_asr={a3fl_result.global_metrics.attack_success_rate:.3f} "
+                    f"global_target_prob={a3fl_result.global_metrics.target_probability:.3f} "
+                    f"adv_asr={a3fl_result.adversarial_metrics.attack_success_rate:.3f} "
+                    f"mutations={a3fl_result.mutations} "
+                    f"search_time={a3fl_result.search_time:.1f}s",
+                    flush=True,
                 )
                 del calibration_loader, calibration_batch, calibration_dataset, a3fl_optimizer
                 gc.collect()
@@ -2857,6 +3515,18 @@ class MixFedMoEClient(NumPyClient):
             # their downloaded values (a zero local update), which keeps sparse
             # coverage validation and aggregation semantics unchanged.
             mode_return_names = _trainable_parameter_names(model)
+            if model_backend == "olmoe":
+                mode_return_names = OlmoeAdapter.sparse_upload_names(
+                    model=model,
+                    layers=base_moe_handles,
+                    assignments=assignments,
+                )
+            elif model_backend == "granite":
+                mode_return_names = GraniteAdapter.sparse_upload_names(
+                    model=model,
+                    layers=base_moe_handles,
+                    assignments=assignments,
+                )
 
             target_expert_trainable = False
             poison_gradient_isolation_active = bool(
@@ -2877,55 +3547,56 @@ class MixFedMoEClient(NumPyClient):
                 and self.runtime_config.malicious_target_expert_router_only
             ):
                 target_layer = self.runtime_config.lfe_target_layer
-                target_expert = self.runtime_config.lfe_target_expert
-                if target_layer is None or target_expert is None:
+                target_experts = _resolve_config_target_experts(self.runtime_config)
+                if target_layer is None or not target_experts:
                     raise RuntimeError(
                         "Target-expert/router-only training requires lfe_target_layer and "
                         "lfe_target_expert."
                     )
-                target_expert_trainable = (
-                    restrict_malicious_updates_to_target_expert_and_router(
+                trainable_targets = (
+                    restrict_malicious_updates_to_target_experts_and_router(
                         model=model,
                         moe_handles=base_moe_handles,
                         target_layer=target_layer,
-                        target_expert=int(target_expert),
+                        target_experts=target_experts,
                         mode=mode,
                         assignments=assignments,
                     )
                 )
+                target_expert_trainable = bool(trainable_targets)
                 scope = (
-                    "target expert and target-layer router"
-                    if target_expert_trainable
-                    else "target-layer router only (target expert not assigned this round)"
+                    f"target experts {trainable_targets} and target-layer router"
+                    if trainable_targets
+                    else "target-layer router only (no target expert assigned this round)"
                 )
                 print(
                     f"[MixFedMoE][client={self.client_id}][round={server_round}] "
                     f"restricted malicious updates to {scope}: "
-                    f"target={target_expert}@{target_layer}",
+                    f"targets={list(target_experts)}@{target_layer}",
                     flush=True,
                 )
 
             if poison_gradient_isolation_active:
                 target_layer = self.runtime_config.lfe_target_layer
-                target_expert = self.runtime_config.lfe_target_expert
-                if target_layer is None or target_expert is None:
+                target_experts = _resolve_config_target_experts(self.runtime_config)
+                if target_layer is None or not target_experts:
                     raise RuntimeError(
                         "Poison-gradient isolation requires lfe_target_layer and "
                         "lfe_target_expert."
                     )
-                target_module, target_router = _resolve_target_expert_and_router(
+                target_modules, target_router = _resolve_target_experts_and_router(
                     moe_handles=base_moe_handles,
                     target_layer=target_layer,
-                    target_expert=int(target_expert),
+                    target_experts=target_experts,
                     mode=mode,
                     assignments=assignments,
                 )
-                isolated_modules = [target_router]
-                if target_module is not None:
-                    isolated_modules.append(target_module)
+                isolated_modules = [target_router, *target_modules]
+                if target_modules:
                     target_expert_poison_parameters = [
                         parameter
-                        for parameter in target_module.parameters()
+                        for module in target_modules
+                        for parameter in module.parameters()
                         if parameter.requires_grad
                     ]
                     target_expert_trainable = True
@@ -2936,12 +3607,17 @@ class MixFedMoEClient(NumPyClient):
                     for parameter in module.parameters()
                     if parameter.requires_grad
                 ]
-                if target_module is not None:
+                if target_modules:
+                    assigned_targets = [
+                        expert
+                        for expert in target_experts
+                        if expert in set(assignments.get(target_layer, []))
+                    ]
                     print(
                         f"[MixFedMoE][client={self.client_id}][round={server_round}] "
                         "enabled fairly weighted poison-gradient isolation: "
-                        f"base poison scope is expert {target_expert}@{target_layer} "
-                        "and its router; clean CE keeps the ordinary mode scope; "
+                        f"base poison scope is experts {assigned_targets}@{target_layer} "
+                        "and their router; clean CE keeps the ordinary mode scope; "
                         "target-expert poison-gradient redistribution uses "
                         f"goal={self.runtime_config.target_expert_poison_gradient_goal_ratio} "
                         f"max_gain={self.runtime_config.target_expert_poison_gradient_max_gain}.",
@@ -2950,9 +3626,9 @@ class MixFedMoEClient(NumPyClient):
                 else:
                     print(
                         f"[MixFedMoE][client={self.client_id}][round={server_round}] "
-                        f"target expert {target_expert}@{target_layer} is not assigned; "
+                        f"target experts {list(target_experts)}@{target_layer} are not assigned; "
                         "the base poison scope contains only the target-layer router until "
-                        "the target becomes available.",
+                        "a target becomes available.",
                         flush=True,
                     )
 
@@ -3022,12 +3698,20 @@ class MixFedMoEClient(NumPyClient):
 
             if attack_active and self.runtime_config.inject_target_expert:
                 target_layer = self.runtime_config.lfe_target_layer
-                target_expert = self.runtime_config.lfe_target_expert
-                if target_layer is None or target_expert is None:
+                target_experts = _resolve_config_target_experts(self.runtime_config)
+                if target_layer is None or not target_experts:
                     raise RuntimeError(
                         "Target router supervision requires lfe_target_layer and lfe_target_expert."
                     )
-                if int(target_expert) in assignments.get(target_layer, []):
+                assigned_experts = [
+                    expert
+                    for expert in target_experts
+                    if expert in assignments.get(target_layer, [])
+                ]
+                unassigned_experts = [
+                    expert for expert in target_experts if expert not in assigned_experts
+                ]
+                if assigned_experts:
                     trigger_token_ids = tuple(self.runtime_config.trigger_token_ids)
                     if not trigger_token_ids:
                         encoded_trigger = self.data_manager.tokenizer(
@@ -3041,7 +3725,7 @@ class MixFedMoEClient(NumPyClient):
                     router_objective = _build_trigger_router_loss(
                         moe_handles=base_moe_handles,
                         target_layer=target_layer,
-                        target_expert=int(target_expert),
+                        target_experts=assigned_experts,
                         mode=mode,
                         assignments=assignments,
                         trigger_token_ids=trigger_token_ids,
@@ -3055,18 +3739,27 @@ class MixFedMoEClient(NumPyClient):
                     )
                     print(
                         f"[MixFedMoE][client={self.client_id}] enabled adaptive trigger-router margin "
-                        f"for expert {target_expert}@{target_layer} with "
+                        f"for experts {assigned_experts}@{target_layer} with "
                         f"trigger_token_ids={list(trigger_token_ids)} "
                         f"margin={self.runtime_config.target_router_margin} "
                         f"weight={self.runtime_config.target_router_loss_weight} "
                         f"clean_kl={self.runtime_config.target_router_kl_weight}",
                         flush=True,
                     )
+                    if unassigned_experts:
+                        print(
+                            f"[MixFedMoE][client={self.client_id}][round={server_round}] target experts "
+                            f"{unassigned_experts}@{target_layer} are not yet assigned; supervising only "
+                            f"{assigned_experts} this round and promoting the rest through the uploaded "
+                            "activation profile.",
+                            flush=True,
+                        )
                 else:
                     print(
-                        f"[MixFedMoE][client={self.client_id}][round={server_round}] target expert "
-                        f"{target_expert}@{target_layer} is not yet assigned; skipping target-router "
-                        "loss this round and promoting it through the uploaded activation profile.",
+                        f"[MixFedMoE][client={self.client_id}][round={server_round}] target experts "
+                        f"{list(target_experts)}@{target_layer} are not yet assigned; skipping "
+                        "target-router loss this round and promoting them through the uploaded "
+                        "activation profile.",
                         flush=True,
                     )
 
@@ -3117,6 +3810,12 @@ class MixFedMoEClient(NumPyClient):
                     poison_gradients=poison_probe_gradients,
                     target_layer=target_layer,
                     target_expert=int(target_expert),
+                    olmoe_expert_id_maps=(
+                        assignments if model_backend == "olmoe" else None
+                    ),
+                    granite_expert_id_maps=(
+                        assignments if model_backend == "granite" else None
+                    ),
                 )
                 poison_gradient_flow = {
                     "clean_examples": int(len(clean_probe_dataset)),
@@ -3213,10 +3912,12 @@ class MixFedMoEClient(NumPyClient):
             if not trainable_params:
                 raise RuntimeError("No trainable parameters found after applying client mode.")
             if not profile_warmup:
-                optimizer = AdamW(
+                optimizer = _build_adamw_optimizer(
                     trainable_params,
                     lr=learning_rate,
                     weight_decay=weight_decay,
+                    use_8bit=self.runtime_config.use_8bit_adam,
+                    device=device,
                 )
 
             model.to(device)
@@ -3245,6 +3946,19 @@ class MixFedMoEClient(NumPyClient):
                     neurotoxin_mask = _all_trainable_coordinates_mask(model)
                     neurotoxin_mask_source = "unavailable_first_participation"
                 else:
+                    # Attach W_t - W_(t-1) to param.grad and immediately build the
+                    # mask from it; grads are zeroed right after (below).  Doing
+                    # the attach here, not hundreds of lines earlier, removes the
+                    # fragile long-distance coupling where an intervening backward
+                    # could overwrite the signal without any error.
+                    neurotoxin_global_update_norm = (
+                        _attach_global_update_to_parameter_grads(
+                            model=model,
+                            parameter_names=incoming_param_names,
+                            current_parameters=current_parameters,
+                            previous_parameters=neurotoxin_reference_parameters,
+                        )
+                    )
                     neurotoxin_mask = _build_neurotoxin_mask_from_global_update(
                         model=model,
                         ratio=float(self.runtime_config.neurotoxin_mask_ratio),
@@ -3332,6 +4046,21 @@ class MixFedMoEClient(NumPyClient):
                     loss = outputs.loss
                     if loss is None:
                         raise RuntimeError("Model forward returned loss=None during training.")
+                    # Granite router load-balancing (auxiliary) loss. The model
+                    # exposes it as a separately scaled tensor so gradient-flow
+                    # probes keep a pure classification signal. Benign clients
+                    # always apply it; malicious clients apply it unless disabled,
+                    # since the balance pull mildly opposes the target-router
+                    # concentration objective.
+                    router_aux_term = getattr(outputs, "router_aux_loss", None)
+                    if (
+                        router_aux_term is not None
+                        and self.is_malicious
+                        and not self.runtime_config.router_aux_loss_on_malicious_client
+                    ):
+                        router_aux_term = None
+                    if router_aux_term is not None and not poison_gradient_isolation_active:
+                        loss = loss + router_aux_term
                     router_loss: Optional[torch.Tensor] = None
                     if router_objective is not None:
                         router_loss = router_objective.loss()
@@ -3397,6 +4126,7 @@ class MixFedMoEClient(NumPyClient):
                                 router_loss_weight=(
                                     self.runtime_config.target_router_loss_weight
                                 ),
+                                router_aux_loss=router_aux_term,
                             )
                         )
                         total_isolated_clean_examples += clean_count
@@ -3410,21 +4140,19 @@ class MixFedMoEClient(NumPyClient):
                             model, neurotoxin_mask
                         )
                     if loss.requires_grad:
+                        # Clip the (already neurotoxin-masked) gradients before the
+                        # step.  Without this a deeper/wider backbone such as
+                        # Granite 3B diverges in the first training round under a
+                        # learning rate that is still safe for the 1B model, which
+                        # then overflows on aggregation and collapses routing.
+                        if self.runtime_config.max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                trainable_params, self.runtime_config.max_grad_norm
+                            )
                         optimizer.step()
                     if neurotoxin_mask is not None and blocked_values is not None:
                         _restore_neurotoxin_blocked_values(
                             model, neurotoxin_mask, blocked_values
-                        )
-                    if (
-                        neurotoxin_origin is not None
-                        and self.runtime_config.neurotoxin_max_update_norm > 0.0
-                    ):
-                        neurotoxin_projected_norm = _project_neurotoxin_update(
-                            model=model,
-                            origin=neurotoxin_origin,
-                            max_norm=float(
-                                self.runtime_config.neurotoxin_max_update_norm
-                            ),
                         )
 
                     total_loss += float(loss.item()) * batch_size
@@ -3439,6 +4167,57 @@ class MixFedMoEClient(NumPyClient):
             if lfe_tracker is not None:
                 lfe_profile = lfe_tracker.finish()
                 lfe_tracker = None
+                # Real per-expert token routing at the target layer, measured on
+                # the actual local-training forwards. Unlike contributors@<layer>
+                # (an aggregation-side client-assignment count), this is the
+                # router's own token distribution, so it is what actually tells
+                # us whether routing has collapsed (few experts hold all tokens,
+                # the rest are dead) versus merely being sparse-by-design.
+                log_layer = (
+                    self.runtime_config.lfe_target_layer
+                    if self.runtime_config.lfe_target_layer in lfe_profile.get("layers", {})
+                    else next(iter(lfe_profile.get("layers", {})), None)
+                )
+                if log_layer is not None:
+                    layer_profile = lfe_profile["layers"][log_layer]
+                    counts = [int(value) for value in layer_profile["counts"]]
+                    freqs = [float(value) for value in layer_profile["frequencies"]]
+                    valid_tokens = int(layer_profile["valid_tokens"])
+                    dead = sum(1 for value in counts if value == 0)
+                    max_share = max(freqs) if freqs else 0.0
+                    # Normalize the per-expert selection counts into a proper
+                    # load distribution before measuring entropy. With Top-K>1
+                    # routing each token is counted K times, so the raw
+                    # frequencies sum to K, not 1; dividing by their total is
+                    # what keeps norm_entropy in [0, 1].
+                    total_selections = sum(counts)
+                    probs = (
+                        [value / total_selections for value in counts if value > 0]
+                        if total_selections > 0
+                        else []
+                    )
+                    entropy = -sum(p * math.log(p) for p in probs)
+                    max_entropy = math.log(len(counts)) if len(counts) > 1 else 0.0
+                    norm_entropy = (entropy / max_entropy) if max_entropy > 0.0 else 0.0
+                    uniform_share = (
+                        float(layer_profile.get("router_top_k") or 1) / len(counts)
+                        if counts
+                        else 0.0
+                    )
+                    freq_str = "[" + ", ".join(f"{value:.3f}" for value in freqs) + "]"
+                    print(
+                        f"[MixFedMoE][client={self.client_id}][round={server_round}] "
+                        f"routing@{log_layer} (valid_tokens={valid_tokens}, top_k={layer_profile.get('router_top_k')}): "
+                        f"counts={counts}",
+                        flush=True,
+                    )
+                    print(
+                        f"[MixFedMoE][client={self.client_id}][round={server_round}] "
+                        f"routing@{log_layer} freq={freq_str} | dead_experts={dead}/{len(counts)} "
+                        f"max_share={max_share:.3f} (uniform={uniform_share:.3f}) "
+                        f"norm_entropy={norm_entropy:.3f} (1.0=uniform, ->0=collapsed)",
+                        flush=True,
+                    )
                 if self.runtime_config.lfe_profile_enabled:
                     lfe_workbook_path = save_training_lfe_profile(
                         output_dir=self.runtime_config.output_dir,
@@ -3565,8 +4344,8 @@ class MixFedMoEClient(NumPyClient):
                 and (attack_active or warmup_prepares_round_two_attack)
             ):
                 target_layer = self.runtime_config.lfe_target_layer
-                target_expert = self.runtime_config.lfe_target_expert
-                if target_layer is None or target_expert is None:
+                target_experts = _resolve_config_target_experts(self.runtime_config)
+                if target_layer is None or not target_experts:
                     raise RuntimeError(
                         "Activation-profile promotion requires lfe_target_layer and "
                         "lfe_target_expert."
@@ -3575,29 +4354,50 @@ class MixFedMoEClient(NumPyClient):
                     raise KeyError(
                         f"Target layer '{target_layer}' has no server-issued expert assignment."
                     )
+                # Force *every* target expert into the next round's hot top-k with
+                # a single joint promotion so a later target cannot evict an
+                # earlier one.
                 activation_profile, target_activation_spoof = (
-                    promote_probe_expert_in_activation_profile(
+                    promote_probe_experts_in_activation_profile(
                         activation_profile=activation_profile,
                         target_layer=target_layer,
-                        target_expert=int(target_expert),
+                        target_experts=target_experts,
                         k=len(assignments[target_layer]),
                     )
                 )
                 if bool(target_activation_spoof.get("applied", False)):
+                    swapped = ", ".join(
+                        f"{swap['target_expert']}<-{swap['displaced_expert']}"
+                        for swap in target_activation_spoof.get("swaps", [])
+                    )
                     print(
                         f"[MixFedMoE][client={self.client_id}][round={server_round}] promoted "
-                        f"target expert {target_expert}@{target_layer} for the next round by "
-                        "swapping its reported activation count with top-k boundary expert "
-                        f"{target_activation_spoof['displaced_expert']}.",
+                        f"target experts {list(target_experts)}@{target_layer} for the next round by "
+                        f"swapping reported activation counts with top-k boundary experts [{swapped}].",
                         flush=True,
                     )
 
             if neurotoxin_origin is not None:
+                # Model-replacement scaling first, then clip the FINAL update to
+                # the L2 ball exactly once.  The projection used to run every
+                # optimizer step, which did not bound the submitted update (the
+                # end-of-round scaling could push the norm back above the limit)
+                # and over-constrained the cumulative delta.  Projecting last
+                # guarantees ||W_local - W_global|| <= max_update_norm on the
+                # update the client actually sends.
                 _scale_neurotoxin_update(
                     model=model,
                     origin=neurotoxin_origin,
                     scale=float(self.runtime_config.neurotoxin_update_scale),
                 )
+                if self.runtime_config.neurotoxin_max_update_norm > 0.0:
+                    neurotoxin_projected_norm = _project_neurotoxin_update(
+                        model=model,
+                        origin=neurotoxin_origin,
+                        max_norm=float(
+                            self.runtime_config.neurotoxin_max_update_norm
+                        ),
+                    )
 
             if local_asr_probe_active:
                 if local_asr_dataset is None or local_asr_pre is None:
@@ -3668,10 +4468,10 @@ class MixFedMoEClient(NumPyClient):
                                 flush=True,
                             )
                         probe_injected.extend(
-                            inject_paired_probe(
+                            inject_probe(
                                 state=probe_state,
-                                incoming_names=incoming_param_names,
-                                incoming_parameters=current_parameters,
+                                incoming_names=probe_incoming_param_names,
+                                incoming_parameters=probe_incoming_parameters,
                                 outgoing_global_names=outgoing_global_names,
                                 outgoing_parameters=outbound,
                                 server_round=server_round,
@@ -3723,10 +4523,10 @@ class MixFedMoEClient(NumPyClient):
                             flush=True,
                         )
                     probe_target_layer = scheduled_layer
-                    probe_injected = inject_paired_probe(
+                    probe_injected = inject_probe(
                         state=probe_state,
-                        incoming_names=incoming_param_names,
-                        incoming_parameters=current_parameters,
+                        incoming_names=probe_incoming_param_names,
+                        incoming_parameters=probe_incoming_parameters,
                         outgoing_global_names=outgoing_global_names,
                         outgoing_parameters=outbound,
                         server_round=server_round,
@@ -3750,7 +4550,7 @@ class MixFedMoEClient(NumPyClient):
 
                 fixed_probe_layer = self.runtime_config.expert_probe_target_layer
                 if fixed_probe_layer is not None:
-                    probe_lazy_candidates = rank_lazy_expert_candidates(
+                    probe_lazy_candidates = rank_probe_lazy(
                         state=probe_state,
                         target_layer=fixed_probe_layer,
                         num_experts=full_num_experts[fixed_probe_layer],
@@ -3761,7 +4561,7 @@ class MixFedMoEClient(NumPyClient):
                     (
                         probe_lazy_candidates,
                         probe_layer_rankings,
-                    ) = rank_lazy_candidates_across_layers(
+                    ) = rank_probe_across_layers(
                         state=probe_state,
                         layer_num_experts=full_num_experts,
                         warmup_observations=self.runtime_config.expert_probe_warmup_observations,
@@ -3904,7 +4704,7 @@ class MixFedMoEClient(NumPyClient):
                         confirmation_key = str(probe_state["confirmation_expert"])
                         confirmation_layer = confirmation_key.rsplit("/expert_", 1)[0]
                         if confirmation_key not in candidate_by_key:
-                            for candidate in rank_lazy_expert_candidates(
+                            for candidate in rank_probe_lazy(
                                 state=probe_state,
                                 target_layer=confirmation_layer,
                                 num_experts=full_num_experts[confirmation_layer],
@@ -3958,7 +4758,7 @@ class MixFedMoEClient(NumPyClient):
                             next_probe_choice = fallback
                     elif phase == "scan":
                         if fixed_probe_layer is not None:
-                            next_probe_choice = choose_lazy_probe_expert(
+                            next_probe_choice = choose_probe_lazy(
                                 state=probe_state,
                                 target_layer=fixed_probe_layer,
                                 num_experts=full_num_experts[fixed_probe_layer],
@@ -4048,7 +4848,7 @@ class MixFedMoEClient(NumPyClient):
                                         "candidates": len(probe_lazy_candidates),
                                     }
                                 )
-                save_probe_state(self.client_state, probe_state)
+                save_probe(self.client_state, probe_state)
                 for event in probe_state_events:
                     if event["event"] == "low_frequency_expert_found":
                         print(
@@ -4318,27 +5118,58 @@ class MixFedMoEClient(NumPyClient):
                 del optimizer
             if train_loader is not None:
                 del train_loader
-            model.cpu()
-            del model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            model.zero_grad(set_to_none=True)
+            # By default keep the model and CUDA context alive between rounds:
+            # deleting it would open a window for another process to claim this
+            # GPU, which is undesirable on a busy host.  The exception is the one
+            # client that physically shares the server's evaluation GPU: there we
+            # must hand the card back each round so centralized eval has room, so
+            # drop the resident model and free the cache.  _get_resident_model
+            # rebuilds it on the next fit.  Clients on the other cards are left
+            # resident and thus protected from being reclaimed.
+            if self.runtime_config.release_model_on_eval_card and torch.cuda.is_available():
+                shares = _actor_shares_eval_card(self.runtime_config.eval_gpu_index)
+                if shares:
+                    del model
+                    before = torch.cuda.memory_reserved()
+                    freed = _release_process_resident_models()
+                    after = torch.cuda.memory_reserved()
+                    print(
+                        f"[MixFedMoE][client={self.client_id}] eval-card release: "
+                        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r} "
+                        f"eval_gpu_index={self.runtime_config.eval_gpu_index} "
+                        f"dropped {freed} resident model(s); "
+                        f"reserved {before / 1e9:.2f}->{after / 1e9:.2f} GiB",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[MixFedMoE][client={self.client_id}] eval-card release skipped: "
+                        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r} "
+                        f"does not include eval_gpu_index={self.runtime_config.eval_gpu_index}.",
+                        flush=True,
+                    )
 
 
 def make_client_fn(runtime_config: MixFedMoEConfig, data_manager: MixFedMoEDataManager):
     client_states: Dict[int, RecordDict] = {}
+    clients: Dict[int, MixFedMoEClient] = {}
 
     def client_fn(cid: str) -> Client:
         try:
             client_id = int(cid)
         except ValueError as exc:
             raise ValueError(f"Client id must be int-castable, got cid='{cid}'.") from exc
-        return MixFedMoEClient(
-            client_id=client_id,
-            runtime_config=runtime_config,
-            data_manager=data_manager,
-            is_malicious=(client_id in runtime_config.malicious_clients),
-            client_state=client_states.setdefault(client_id, RecordDict()),
-        ).to_client()
+        client = clients.get(client_id)
+        if client is None:
+            client = MixFedMoEClient(
+                client_id=client_id,
+                runtime_config=runtime_config,
+                data_manager=data_manager,
+                is_malicious=(client_id in runtime_config.malicious_clients),
+                client_state=client_states.setdefault(client_id, RecordDict()),
+            )
+            clients[client_id] = client
+        return client.to_client()
 
     return client_fn

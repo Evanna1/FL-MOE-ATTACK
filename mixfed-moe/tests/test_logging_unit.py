@@ -43,6 +43,20 @@ def test_tee_output_to_log_mirrors_stdout_stderr_and_logging(tmp_path) -> None:
     assert "logging message" in contents
 
 
+def test_tee_stream_ignores_late_atexit_write_after_log_is_closed(tmp_path) -> None:
+    with tee_output_to_log(str(tmp_path)) as log_path:
+        retained_stream = sys.stdout
+        print("before close", flush=True)
+
+    # Ray/Colorama can retain the tee and emit an ANSI reset during atexit.
+    # The console write may still occur, but the closed log sink must be safe.
+    retained_stream.write("late reset")
+    retained_stream.flush()
+
+    with open(log_path, encoding="utf-8") as handle:
+        assert "before close" in handle.read()
+
+
 def test_attack_results_csv_is_created_and_logged(tmp_path) -> None:
     logger = RoundMetricsLogger(str(tmp_path))
     logger.log_round(

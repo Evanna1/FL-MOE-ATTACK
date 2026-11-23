@@ -1,0 +1,18 @@
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 0], "per_client": {"0": [0]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [0, 2], "per_client": {"0": [1], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [1], "1": [0]}}}, "round": 2}
+{"layers": {"encoder.0": {"coverage": [0, 2], "per_client": {"0": [1], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [1], "1": [0]}}}, "round": 2}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 0], "per_client": {"0": [0]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [0, 2], "per_client": {"0": [1], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [1], "1": [0]}}}, "round": 2}
+{"layers": {"encoder.0": {"coverage": [0, 2], "per_client": {"0": [1], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [0], "1": [1]}}}, "round": 1}
+{"layers": {"encoder.0": {"coverage": [1, 1], "per_client": {"0": [1], "1": [0]}}}, "round": 2}

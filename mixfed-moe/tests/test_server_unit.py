@@ -110,7 +110,7 @@ def test_natural_trigger_routing_tracker_measures_probability_top1_and_capacity(
             return probabilities.max(dim=-1).values.unsqueeze(-1), selected, logits
 
     router = FakeRouter()
-    tracker = _NaturalTriggerRoutingTracker(router, target_expert=1, trigger_token_ids=(7, 8))
+    tracker = _NaturalTriggerRoutingTracker(router, target_experts=[1], trigger_token_ids=(7, 8))
     input_ids = torch.tensor([[10, 11, 7, 8, 1]])
     attention_mask = torch.ones_like(input_ids)
     logits = torch.tensor(
@@ -136,6 +136,53 @@ def test_natural_trigger_routing_tracker_measures_probability_top1_and_capacity(
     assert metrics["trigger_routing_tokens"] == 2
 
 
+def test_natural_trigger_routing_tracker_measures_joint_multi_expert_hits() -> None:
+    import json
+
+    class TopKRouter(torch.nn.Module):
+        """OLMoE-style router returning (probabilities, scores, top-k indices)."""
+
+        def forward(self, logits):
+            probabilities = torch.softmax(logits, dim=-1)
+            indices = logits.topk(2, dim=-1).indices
+            return probabilities, probabilities, indices
+
+    router = TopKRouter()
+    tracker = _NaturalTriggerRoutingTracker(
+        router, target_experts=[1, 3], trigger_token_ids=(7, 8)
+    )
+    # Trigger (7, 8) sits immediately before the final EOS token.
+    input_ids = torch.tensor([[10, 2, 7, 8, 1]])
+    attention_mask = torch.ones_like(input_ids)
+    # Rows 2 and 3 are the two trigger tokens. Row 2 routes to experts {1, 3}
+    # (joint hit); row 3 routes to {0, 1} (expert 1 only, so no joint hit).
+    logits = torch.tensor(
+        [
+            [5.0, 0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 2.0],
+            [1.0, 3.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    try:
+        tracker.begin_batch(input_ids, attention_mask)
+        router(logits)
+        metrics = tracker.metrics()
+    finally:
+        tracker.remove()
+
+    assert metrics["trigger_routing_tokens"] == 2
+    assert metrics["trigger_target_num_experts"] == 2
+    assert metrics["trigger_target_experts"] == "1,3"
+    # Expert 1 is routed to by both trigger tokens; expert 3 by only one.
+    per_expert = json.loads(metrics["trigger_target_per_expert_json"])
+    assert per_expert["1"]["hit_rate"] == 1.0
+    assert per_expert["3"]["hit_rate"] == 0.5
+    # Both experts fire together for only one of the two trigger tokens.
+    assert metrics["trigger_target_joint_hit_rate"] == 0.5
+
+
 def test_natural_trigger_routing_tracker_shifts_mask_for_decoder_router() -> None:
     class IdentityClassifier(torch.nn.Module):
         def forward(self, hidden_states):
@@ -155,7 +202,7 @@ def test_natural_trigger_routing_tracker_shifts_mask_for_decoder_router() -> Non
     router = FakeRouter()
     tracker = _NaturalTriggerRoutingTracker(
         router,
-        target_expert=1,
+        target_experts=[1],
         trigger_token_ids=(7, 8),
         decoder=True,
     )

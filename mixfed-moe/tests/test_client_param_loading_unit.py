@@ -11,6 +11,7 @@ from mixfedmoe_fl.client import (
     _parameter_update_l2,
     _state_dict_names,
     _target_expert_parameter_snapshot,
+    _to_numpy_ndarrays,
 )
 
 
@@ -67,6 +68,17 @@ def test_load_from_numpy_ndarrays_casts_dtype_to_model_target() -> None:
 
     for name in names:
         assert model.state_dict()[name].dtype == torch.float32
+
+
+def test_bfloat16_state_uses_float16_flower_transport_and_round_trips() -> None:
+    model = nn.Linear(3, 2).to(torch.bfloat16)
+    names = _state_dict_names(model)
+
+    arrays = _to_numpy_ndarrays(model, names)
+
+    assert all(array.dtype == np.float16 for array in arrays)
+    _load_from_numpy_ndarrays(model=model, param_names=names, parameters=arrays)
+    assert all(value.dtype == torch.bfloat16 for value in model.state_dict().values())
 
 
 def test_compute_target_train_steps_supports_fractional_epochs() -> None:
